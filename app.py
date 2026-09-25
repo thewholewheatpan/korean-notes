@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (1단 & 2단 지원) ---
+# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 지문/보기(※) 및 여백 최적화) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -36,26 +36,79 @@ def process_pdf_and_extract_questions(pdf_bytes):
         rect = page.rect
         mid_x = rect.width / 2.0
         
-        blocks = page.get_text("blocks")
-        for b in blocks:
-            text = b[4].strip()
-            match = re.match(r'^(\d{1,2})\.\s*', text)
-            if match:
-                q_num = int(match.group(1))
-                x0, y0, x1, y1 = b[0], b[1], b[2], b[3]
-                col = 0 if x0 < mid_x else 1
-                
-                question_data.append({
-                    'q_num': q_num,
-                    'page': page_num,
-                    'col': col,
-                    'x0': x0,
-                    'y0': y0,
-                    'y1': y1,
-                    'page_width': rect.width,
-                    'page_height': rect.height
-                })
+        # 헤더/푸터 제외 높이 영역 설정 (상위 4%, 하위 9% 영역 제외)
+        header_limit = rect.height * 0.04
+        footer_limit = rect.height * 0.91
 
+        blocks = page.get_text("blocks")
+        
+        left_blocks = []
+        right_blocks = []
+        
+        for b in blocks:
+            x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
+            
+            # 푸터/헤더 및 페이지 번호 형태(-1-) 무시
+            if y0 >= footer_limit or y1 <= header_limit:
+                continue
+            if re.match(r'^-\s*\d+\s*-$', text):
+                continue
+                
+            col = 0 if x0 < mid_x else 1
+            if col == 0:
+                left_blocks.append(b)
+            else:
+                right_blocks.append(b)
+
+        # 각 컬럼 내에서 y0 (위에서 아래) 순으로 정렬하여 처리
+        for col, col_blocks in enumerate([left_blocks, right_blocks]):
+            col_blocks.sort(key=lambda x: x[1])
+            
+            current_passage_y0 = None
+            current_q = None
+
+            for b in col_blocks:
+                x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
+
+                # 문제 번호 패턴 (예: "1. ", "01. ")
+                match = re.match(r'^(\d{1,2})\.\s*', text)
+
+                # 지문/보기 시작 문구 패턴 (※, * <보기>, [1~3] 등)
+                is_passage = (
+                    text.startswith('※') or
+                    re.match(r'^[※\*]\s*<보기>', text) or
+                    re.match(r'^[※\*]\s*다음', text) or
+                    re.match(r'^\[\d+[\s~–-]+\d+\]', text)
+                )
+
+                # 문제 전에 지문/보기가 먼저 나온 경우 시작 Y좌표 기록
+                if is_passage and current_passage_y0 is None and match is None:
+                    current_passage_y0 = y0
+
+                # 문제 번호를 만난 경우
+                if match:
+                    q_num = int(match.group(1))
+                    
+                    # 지문/보기가 먼저 있었으면 그 시작 위치부터 포함
+                    start_y0 = current_passage_y0 if current_passage_y0 is not None else y0
+                    current_passage_y0 = None  # 다음 문제를 위해 초기화
+
+                    current_q = {
+                        'q_num': q_num,
+                        'page': page_num,
+                        'col': col,
+                        'y0': start_y0,
+                        'max_y1': y1,
+                        'page_width': rect.width,
+                        'page_height': rect.height
+                    }
+                    question_data.append(current_q)
+
+                # 현재 등록된 문제에 속하는 하위 텍스트 블록들의 max_y1 갱신
+                elif current_q is not None:
+                    current_q['max_y1'] = max(current_q['max_y1'], y1)
+
+    # 페이지 ➔ 컬럼 ➔ Y좌표 순 정렬
     question_data.sort(key=lambda x: (x['page'], x['col'], x['y0']))
     extracted_questions = []
 
@@ -74,6 +127,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
         mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
         has_right_col = any(item['page'] == page_num and item['col'] == 1 for item in question_data)
         
+        # 좌/우 컬럼 구분
         if has_right_col:
             if col == 0:
                 crop_left = 0
@@ -85,18 +139,23 @@ def process_pdf_and_extract_questions(pdf_bytes):
             crop_left = 0
             crop_right = img.width
 
+        # 상단 시작 위치 (-10px 여유)
         crop_top = max(0, int(q['y0'] * scale_y) - 10)
         
+        # 다음 문제 위치 확인
         next_q_same_col = None
         for j in range(i + 1, len(question_data)):
             if question_data[j]['page'] == page_num and question_data[j]['col'] == col:
                 next_q_same_col = question_data[j]
                 break
                 
+        # 하단 자르기 위치 결정 (다음 문제 전 OR 실제 텍스트 끝 + 여백)
         if next_q_same_col:
             crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 5)
         else:
-            crop_bottom = img.height
+            # 컬럼의 마지막 문제: 실제 내용 끝(max_y1) + 적절한 여백(20pt), 푸터 영역 제한
+            max_content_y = min(q['max_y1'] + 20, q['page_height'] * 0.91)
+            crop_bottom = min(img.height, int(max_content_y * scale_y))
 
         if crop_bottom > crop_top + 30 and crop_right > crop_left + 30:
             cropped_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
@@ -152,7 +211,6 @@ def get_homeworks():
     conn.close()
     return data
 
-# ✨ [신규] 숙제 삭제 함수 (숙제, 관련 문제, 관련 학생 제출 내역까지 연쇄 삭제)
 def delete_homework(hw_id):
     conn = sqlite3.connect('wrong_answer_db.db')
     c = conn.cursor()
@@ -297,7 +355,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             st.session_state["admin_logged_in"] = False
             st.rerun()
 
-        # ✨ [개선] 탭 구성 확장 (숙제 등록 / 등록된 숙제 관리 / 오답노트 인쇄)
         teacher_tab1, teacher_tab2, teacher_tab3 = st.tabs([
             "📤 새 숙제 등록", 
             "📚 등록된 숙제 목록 및 삭제", 
@@ -312,7 +369,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 텍스트 선택이 가능한 PDF를 올리면 1단/2단 구분 후 문제 단위로 정밀하게 자릅니다.")
+                st.info("💡 **PDF 지원 안내**: 지문/보기(※)를 정밀 분석하여 여백 없이 깔끔하게 자릅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
@@ -349,7 +406,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_id = save_homework_from_images(hw_title.strip(), uploaded_files)
                         st.success(f"✅ '{hw_title}' 등록 완료! 총 {len(uploaded_files)}문제가 저장되었습니다.")
         
-        # --- [탭 2] ✨ 등록된 숙제 목록 및 삭제 ---
+        # --- [탭 2] 등록된 숙제 목록 및 삭제 ---
         with teacher_tab2:
             st.markdown("### 📚 등록된 숙제 목록 및 삭제 관리")
             
@@ -369,7 +426,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         st.caption(f"🗓️ **등록 일시:** {created_at} | 🧩 **총 문항 수:** {q_count}문제")
                         
                     with col2:
-                        # 숙제 삭제 버튼
                         if st.button(f"🗑️ 숙제 삭제", key=f"del_hw_{hw_id}"):
                             delete_homework(hw_id)
                             st.success(f"'{title}' 숙제가 삭제되었습니다.")
