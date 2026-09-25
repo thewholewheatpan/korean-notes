@@ -1,3 +1,4 @@
 streamlit
-pillow
-pymupdf
+pandas
+gspread
+google-auth
