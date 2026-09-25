@@ -26,17 +26,20 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 주관식 <조건> 및 하단 여백 최적화) ---
+# --- 2. PDF 문제 자동 자르기 (순차적 문제 번호 기반 정밀 추출) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
+    
+    # 전체 PDF 기준 다음 예상 문제 번호 (1번부터 순차 탐색)
+    expected_q_num = None
 
     for page_num in range(len(doc)):
         page = doc[page_num]
         rect = page.rect
         mid_x = rect.width / 2.0
         
-        # 헤더/푸터 제외 높이 영역 설정 (상위 7.5% 헤더/단원제외, 하위 7% 푸터 제외)
+        # 상단/하단 불필요 영역 제외 (상위 7.5%, 하위 7%)
         header_limit = rect.height * 0.075
         footer_limit = rect.height * 0.93
 
@@ -48,59 +51,48 @@ def process_pdf_and_extract_questions(pdf_bytes):
         for b in blocks:
             x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
             
-            # 푸터/헤더 및 페이지 번호 형태(-1-) 무시
             if y0 >= footer_limit or y1 <= header_limit:
                 continue
             if re.match(r'^-\s*\d+\s*-$', text):
                 continue
-            # 단원 제목 형태 ("2-3 음운의 변동", "1-2" 등) 제외
             if re.match(r'^\d+[\-~]\d+', text):
                 continue
                 
-            col = 0 if x0 < mid_x else 1
-            if col == 0:
+            if x0 < mid_x:
                 left_blocks.append(b)
             else:
                 right_blocks.append(b)
 
-        # 각 컬럼 내에서 y0 (위에서 아래) 순으로 정렬하여 처리
+        # 컬럼별 Y좌표 정렬 후 파싱
         for col, col_blocks in enumerate([left_blocks, right_blocks]):
             col_blocks.sort(key=lambda x: x[1])
             
             current_passage_y0 = None
             current_q = None
-            last_q_num = None
-            in_condition = False  # 주관식 <조건> 상자 내부 상태 여부
 
             for b in col_blocks:
                 x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
 
-                # 단원 제목 형태 재확인 ("2-3", "1-2" 등)
                 if re.match(r'^\d+[\-~]\d+', text):
                     continue
 
-                # 주관식 <조건> 감지
-                if '<조건>' in text or '[조건]' in text or text.startswith('※ 조건') or text.startswith('조건'):
-                    in_condition = True
+                # 문제 번호 패턴 (예: "1. ", "01. ", "23. ")
+                match = re.match(r'^\s*(\d{1,2})\.\s*', text)
+                
+                is_real_question = False
+                q_num = None
 
-                # 문제 번호 패턴 (예: "1. ", "01. ")
-                match = re.match(r'^(\d{1,2})\.\s*', text)
-
-                # 조건(1., 2., 3.) 인 경우 문제 번호에서 예외 처리
                 if match:
-                    cand_q_num = int(match.group(1))
-                    expected_q_num = (last_q_num + 1) if last_q_num is not None else 1
-
-                    if in_condition:
-                        # 조건 상태에서는 다음 정식 문제 번호가 아닌 경우 모두 무시
-                        if cand_q_num != expected_q_num or any(term in text for term in ['할 것', '쓰시오', '포함', '지킬 것', '조건', '<', '>', '작성']):
-                            match = None
-                        else:
-                            in_condition = False
-                            last_q_num = cand_q_num
-                    else:
-                        if cand_q_num == expected_q_num:
-                            last_q_num = cand_q_num
+                    cand_num = int(match.group(1))
+                    # 첫 문제 시작이거나, 정확히 순차적으로 증가하는 번호인 경우만 진짜 문제로 인정
+                    if expected_q_num is None:
+                        q_num = cand_num
+                        expected_q_num = cand_num + 1
+                        is_real_question = True
+                    elif cand_num == expected_q_num:
+                        q_num = cand_num
+                        expected_q_num = cand_num + 1
+                        is_real_question = True
 
                 # 지문/보기 시작 문구 패턴 (※, * <보기>, [1~3] 등)
                 is_passage = (
@@ -110,17 +102,12 @@ def process_pdf_and_extract_questions(pdf_bytes):
                     re.match(r'^\[\d+[\s~–-]+\d+\]', text)
                 )
 
-                # 문제 전에 지문/보기가 먼저 나온 경우 시작 Y좌표 기록
-                if is_passage and current_passage_y0 is None and match is None:
+                if is_passage and current_passage_y0 is None and not is_real_question:
                     current_passage_y0 = y0
 
-                # 정식 문제 번호를 만난 경우
-                if match:
-                    q_num = int(match.group(1))
-                    
-                    # 지문/보기가 먼저 있었으면 그 시작 위치부터 포함
+                if is_real_question:
                     start_y0 = current_passage_y0 if current_passage_y0 is not None else y0
-                    current_passage_y0 = None  # 다음 문제를 위해 초기화
+                    current_passage_y0 = None
 
                     current_q = {
                         'q_num': q_num,
@@ -133,11 +120,9 @@ def process_pdf_and_extract_questions(pdf_bytes):
                     }
                     question_data.append(current_q)
 
-                # 현재 등록된 문제에 속하는 하위 텍스트 블록들의 max_y1 갱신
                 elif current_q is not None:
                     current_q['max_y1'] = max(current_q['max_y1'], y1)
 
-    # 페이지 ➔ 컬럼 ➔ Y좌표 순 정렬
     question_data.sort(key=lambda x: (x['page'], x['col'], x['y0']))
     extracted_questions = []
 
@@ -154,12 +139,10 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_y = img.height / q['page_height']
         
         mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
-        # 중앙 구분선 제거를 위한 안쪽 여백
         divider_margin = int(6 * scale_x)
 
         has_right_col = any(item['page'] == page_num and item['col'] == 1 for item in question_data)
         
-        # 좌/우 컬럼 구분 및 구분선 안 들어가게 넓이 축소
         if has_right_col:
             if col == 0:
                 crop_left = 0
@@ -171,17 +154,14 @@ def process_pdf_and_extract_questions(pdf_bytes):
             crop_left = 0
             crop_right = img.width
 
-        # 상단 시작 위치 (-10px 여유)
         crop_top = max(0, int(q['y0'] * scale_y) - 10)
         
-        # 다음 문제 위치 확인
         next_q_same_col = None
         for j in range(i + 1, len(question_data)):
             if question_data[j]['page'] == page_num and question_data[j]['col'] == col:
                 next_q_same_col = question_data[j]
                 break
                 
-        # 하단 자르기 위치 결정 (다음 문제 전 OR 실제 텍스트 끝 + 넉넉한 여백)
         if next_q_same_col:
             crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 2)
         else:
@@ -299,24 +279,43 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 인쇄용 CSS (2단 레이아웃 유지) ---
+# --- 4. 인쇄 전용 강력 CSS (상단 메뉴, 탭, 사이드바 완전 차단) ---
 st.markdown("""
     <style>
     @media print {
-        [data-testid="stSidebar"] { display: none !important; }
-        header { display: none !important; }
-        footer { display: none !important; }
-        .stButton { display: none !important; }
-        .no-print { display: none !important; }
+        /* Streamlit 기본 메뉴 및 UI 완벽 차단 */
+        [data-testid="stHeader"],
+        [data-testid="stSidebar"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
+        .stTabs [role="tablist"],
+        .no-print,
+        button,
+        header,
+        footer {
+            display: none !important;
+        }
+
+        /* 인쇄 시 여백 최적화 */
+        body {
+            background-color: white !important;
+            color: black !important;
+        }
+        .main .block-container {
+            padding: 0 !important;
+            margin: 0 !important;
+            max-width: 100% !important;
+        }
         .element-container, .stColumn {
-            break-inside: avoid;
+            break-inside: avoid !important;
         }
     }
     </style>
 """, unsafe_allow_html=True)
 
 # --- 5. 선생님 인증 암호 및 로그인 상태 관리 ---
-TEACHER_PASSWORD = "9735"  # 👈 필요 시 선생님 비밀번호로 변경하세요.
+TEACHER_PASSWORD = "9735"
 
 if "admin_logged_in" not in st.session_state:
     st.session_state["admin_logged_in"] = False
@@ -403,7 +402,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 지문/보기(※) 및 주관식 <조건>을 인식하여 문제별로 정확히 잘라냅니다.")
+                st.info("💡 **PDF 지원 안내**: 순차적 문제 번호를 추적하여 지문 및 주관식 <조건>까지 깔끔하게 자릅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
@@ -427,7 +426,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                                         st.image(img_bytes, use_container_width=True)
                                         st.markdown("---")
                             else:
-                                st.error("PDF에서 문제 번호(1., 2. 등)를 찾지 못했습니다. 스캔본(이미지형) PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
+                                st.error("PDF에서 문제 번호를 찾지 못했습니다. 스캔본(이미지형) PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
             
             else:
                 st.info("💡 **팁**: 캡처한 이미지 파일명을 1.png, 2.png 순으로 붙여 업로드하세요.")
@@ -467,7 +466,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                             st.success(f"'{title}' 숙제가 삭제되었습니다.")
                             st.rerun()
 
-                    # 각 숙제별 문제 이미지 확인 (2단 레이아웃 표시)
                     with st.expander(f"🔍 '{title}' 문제 이미지 목록 보기 ({q_count}문항)"):
                         hw_imgs = get_wrong_questions_images(hw_id, list(range(1, q_count + 1)))
                         if hw_imgs:
@@ -482,7 +480,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 (2단 배치) 및 제출 내역 관리 ---
+        # --- [탭 3] 개인별 오답노트 인쇄 (전용 인쇄 버튼 제공) ---
         with teacher_tab3:
             st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
             
@@ -506,7 +504,24 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 인쇄용 상단 헤더 (학생 이름 및 숙제 이름만 대형 강조)
+                # 전용 바로 인쇄 버튼 (클릭 시 웹 UI 차단 후 오답노트만 인쇄)
+                st.components.v1.html("""
+                    <div style="text-align: center;">
+                        <button onclick="window.print()" style="
+                            background-color: #1e88e5;
+                            color: white;
+                            padding: 12px 28px;
+                            font-size: 16px;
+                            font-weight: bold;
+                            border: none;
+                            border-radius: 8px;
+                            cursor: pointer;
+                            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                        ">🖨️ 이 오답노트 바로 인쇄하기 (또는 PDF 저장)</button>
+                    </div>
+                """, height=55)
+
+                # 인쇄용 상단 헤더
                 st.markdown(f"""
                 <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
                     <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
@@ -518,15 +533,11 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 images = get_wrong_questions_images(hw_id, wrong_list)
                 
-                # 원본 시험지처럼 오답 문제를 좌/우 2단 배치
+                # 오답 문제 2단 시험지 배치 ('풀이/정답 작성' 문구 완벽 제거)
                 if images:
                     cols_print = st.columns(2)
                     for idx, (q_num, img_bytes) in enumerate(images):
                         with cols_print[idx % 2]:
                             st.markdown(f"**📍 문제 {q_num}번**")
                             st.image(img_bytes, use_container_width=True)
-                            st.write("📝 **[풀이 / 정답 작성]**")
-                            st.write("\n" * 2)
                             st.markdown("---")
-                    
-                st.markdown("<div class='no-print' style='margin-top: 20px;'><b>💡 인쇄 팁:</b> 웹브라우저에서 <b>Ctrl + P</b> (Mac은 <b>Cmd + P</b>)를 누르면 상단 헤더 및 메뉴바 없이 2단으로 구성된 오답 시험지만 깔끔하게 PDF 저장/인쇄됩니다.</div>", unsafe_allow_html=True)
