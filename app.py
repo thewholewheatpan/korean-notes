@@ -26,10 +26,11 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자르기 엔진 (안정화된 단순 문제 추출 방식) ---
+# --- 2. PDF 문제 자동 자르기 (타이트한 좌우 여백 적용) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
+    
     expected_q_num = None
 
     for page_num in range(len(doc)):
@@ -41,34 +42,51 @@ def process_pdf_and_extract_questions(pdf_bytes):
         footer_limit = rect.height * 0.93
 
         blocks = page.get_text("blocks")
+        
         left_blocks = []
         right_blocks = []
         
         for b in blocks:
             x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
+            
             if y0 >= footer_limit or y1 <= header_limit:
                 continue
-            if re.match(r'^-\s*\d+\s*-$', text) or re.match(r'^\d+[\-~]\d+', text):
+            if re.match(r'^-\s*\d+\s*-$', text):
+                continue
+            if re.match(r'^\d+[\-~]\d+', text):
                 continue
                 
-            if x0 < mid_x and x1 <= mid_x + 10:
+            if x0 < mid_x:
                 left_blocks.append(b)
-            elif x0 >= mid_x - 10:
+            else:
                 right_blocks.append(b)
+
+        # 각 단의 실제 텍스트 영역을 측정하여 타이트한 좌우 경계 설정
+        left_x0 = min([b[0] for b in left_blocks]) - 4 if left_blocks else 0
+        left_x1 = max([b[2] for b in left_blocks]) + 4 if left_blocks else mid_x - 5
+        
+        right_x0 = min([b[0] for b in right_blocks]) - 4 if right_blocks else mid_x + 5
+        right_x1 = max([b[2] for b in right_blocks]) + 4 if right_blocks else rect.width
 
         for col, col_blocks in enumerate([left_blocks, right_blocks]):
             col_blocks.sort(key=lambda x: x[1])
+            
+            current_passage_y0 = None
+            current_q = None
 
             for b in col_blocks:
                 x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
+
                 if re.match(r'^\d+[\-~]\d+', text):
                     continue
 
                 match = re.match(r'^\s*(\d{1,2})\.\s*', text)
+                
+                is_real_question = False
+                q_num = None
 
                 if match:
                     cand_num = int(match.group(1))
-                    is_real_question = False
                     if expected_q_num is None:
                         q_num = cand_num
                         expected_q_num = cand_num + 1
@@ -78,16 +96,38 @@ def process_pdf_and_extract_questions(pdf_bytes):
                         expected_q_num = cand_num + 1
                         is_real_question = True
 
-                    if is_real_question:
-                        question_data.append({
-                            'q_num': q_num,
-                            'page': page_num,
-                            'col': col,
-                            'y0': y0,
-                            'max_y1': y1,
-                            'page_width': rect.width,
-                            'page_height': rect.height
-                        })
+                is_passage = (
+                    text.startswith('※') or
+                    re.match(r'^[※\*]\s*<보기>', text) or
+                    re.match(r'^[※\*]\s*다음', text) or
+                    re.match(r'^\[\d+[\s~–-]+\d+\]', text)
+                )
+
+                if is_passage and current_passage_y0 is None and not is_real_question:
+                    current_passage_y0 = y0
+
+                if is_real_question:
+                    start_y0 = current_passage_y0 if current_passage_y0 is not None else y0
+                    current_passage_y0 = None
+
+                    col_x0 = left_x0 if col == 0 else right_x0
+                    col_x1 = left_x1 if col == 0 else right_x1
+
+                    current_q = {
+                        'q_num': q_num,
+                        'page': page_num,
+                        'col': col,
+                        'x0': col_x0,
+                        'x1': col_x1,
+                        'y0': start_y0,
+                        'max_y1': y1,
+                        'page_width': rect.width,
+                        'page_height': rect.height
+                    }
+                    question_data.append(current_q)
+
+                elif current_q is not None:
+                    current_q['max_y1'] = max(current_q['max_y1'], y1)
 
     question_data.sort(key=lambda x: (x['page'], x['col'], x['y0']))
     extracted_questions = []
@@ -104,34 +144,11 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_x = img.width / q['page_width']
         scale_y = img.height / q['page_height']
         
-        mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
+        # 좌우 여백을 텍스트 영역에 맞추어 균일하고 타이트하게 컷팅
+        crop_left = max(0, int(q['x0'] * scale_x))
+        crop_right = min(img.width, int(q['x1'] * scale_x))
 
-        page_blocks = page.get_text("blocks")
-        q_blocks = []
-        for b in page_blocks:
-            bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
-            if col == 0 and bx1 > (q['page_width'] / 2.0):
-                continue
-            if col == 1 and bx0 < (q['page_width'] / 2.0):
-                continue
-            if by0 >= q['y0'] - 5 and by1 <= q['max_y1'] + 10:
-                q_blocks.append(b)
-
-        if q_blocks:
-            min_x = min([b[0] for b in q_blocks]) - 4
-            max_x = max([b[2] for b in q_blocks]) + 4
-        else:
-            min_x = 0 if col == 0 else (q['page_width'] / 2.0)
-            max_x = (q['page_width'] / 2.0) if col == 0 else q['page_width']
-
-        if col == 0:
-            crop_left = max(0, int(min_x * scale_x))
-            crop_right = min(mid_pixel_x - 6, int(max_x * scale_x))
-        else:
-            crop_left = max(mid_pixel_x + 6, int(min_x * scale_x))
-            crop_right = min(img.width, int(max_x * scale_x))
-
-        crop_top = max(0, int(q['y0'] * scale_y) - 8)
+        crop_top = max(0, int(q['y0'] * scale_y) - 10)
         
         next_q_same_col = None
         for j in range(i + 1, len(question_data)):
@@ -145,11 +162,10 @@ def process_pdf_and_extract_questions(pdf_bytes):
             max_content_y = min(q['max_y1'] + 35, q['page_height'] * 0.93)
             crop_bottom = min(img.height, int(max_content_y * scale_y))
 
-        if crop_bottom > crop_top + 20 and crop_right > crop_left + 20:
-            q_body_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
-
+        if crop_bottom > crop_top + 30 and crop_right > crop_left + 30:
+            cropped_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
             img_byte_arr = io.BytesIO()
-            q_body_img.save(img_byte_arr, format='PNG')
+            cropped_img.save(img_byte_arr, format='PNG')
             extracted_questions.append((q_num, img_byte_arr.getvalue()))
 
     extracted_questions.sort(key=lambda x: x[0])
@@ -257,7 +273,48 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 메인 화면 ---
+# --- 4. 인쇄 전용 CSS (Streamlit 상단 바 및 헤더 완전 숨김) ---
+st.markdown("""
+    <style>
+    @media print {
+        /* Streamlit 최상단 헤더, 툴바, 사이드바 등 인쇄 시 완벽 숨김 */
+        [data-testid="stHeader"],
+        [data-testid="stSidebar"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
+        [data-testid="stElementToolbar"],
+        [data-testid="stAppHeader"],
+        header,
+        footer,
+        .stAppHeader,
+        .stAppToolbar,
+        .stTabs [role="tablist"],
+        .no-print,
+        button,
+        iframe {
+            display: none !important;
+            visibility: hidden !important;
+            height: 0 !important;
+        }
+
+        body, .stApp {
+            background-color: white !important;
+            color: black !important;
+        }
+        .main .block-container {
+            padding: 0 !important;
+            margin: 0 !important;
+            max-width: 100% !important;
+        }
+        .element-container, .stColumn {
+            break-inside: avoid !important;
+        }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- 5. 선생님 인증 암호 및 로그인 상태 관리 ---
 TEACHER_PASSWORD = "1234"
 
 if "admin_logged_in" not in st.session_state:
@@ -345,7 +402,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 순차적 문제 번호를 추적하여 영역별로 자동 잘라냅니다.")
+                st.info("💡 **PDF 지원 안내**: 순차적 문제 번호를 추적하여 지문 및 주관식 <조건>까지 깔끔하게 자릅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
@@ -365,7 +422,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                                 preview_cols = st.columns(2)
                                 for idx, (q_num, img_bytes) in enumerate(preview_images):
                                     with preview_cols[idx % 2]:
-                                        st.markdown(f"**📌 문제 {q_num}번**")
+                                        st.markdown(f"**📍 문제 {q_num}번**")
                                         st.image(img_bytes, use_container_width=True)
                                         st.markdown("---")
                             else:
@@ -384,7 +441,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_id = save_homework_from_images(hw_title.strip(), uploaded_files)
                         st.success(f"✅ '{hw_title}' 등록 완료! 총 {len(uploaded_files)}문제가 저장되었습니다.")
         
-        # --- [탭 2] 등록된 숙제 목록 ---
+        # --- [탭 2] 등록된 숙제 목록 및 문제 이미지 보기 ---
         with teacher_tab2:
             st.markdown("### 📚 등록된 숙제 목록 및 삭제 관리")
             
@@ -415,7 +472,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                             img_cols = st.columns(2)
                             for idx, (q_num, img_bytes) in enumerate(hw_imgs):
                                 with img_cols[idx % 2]:
-                                    st.markdown(f"**📌 문제 {q_num}번**")
+                                    st.markdown(f"**📍 문제 {q_num}번**")
                                     st.image(img_bytes, use_container_width=True)
                                     st.markdown("---")
                         else:
@@ -447,7 +504,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 인쇄 버튼
+                # 부모창 전체 인쇄 버튼
                 st.components.v1.html("""
                     <div style="text-align: center;">
                         <button onclick="window.parent.print()" style="
@@ -464,7 +521,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     </div>
                 """, height=55)
 
-                # 오답노트 인쇄 영역 시작
+                # 인쇄용 헤더
                 st.markdown(f"""
                 <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
                     <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
@@ -476,7 +533,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 images = get_wrong_questions_images(hw_id, wrong_list)
                 
-                # 인쇄 화면에는 '문제 번호 라벨'을 제외하고 순수 문제 이미지만 배치
                 if images:
                     cols_print = st.columns(2)
                     for idx, (q_num, img_bytes) in enumerate(images):
