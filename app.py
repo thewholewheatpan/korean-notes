@@ -182,7 +182,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 5. 선생님 인증 암호 설정 (기본값: 1234) ---
-TEACHER_PASSWORD = "1234"
+TEACHER_PASSWORD = "9735"
 
 st.title("📚 국어 오답노트 생성 시스템")
 
