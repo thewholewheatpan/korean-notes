@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 지문/보기(※), 단원제외 및 구분선 정밀 제거) ---
+# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 하단 여백 최적화) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -36,9 +36,9 @@ def process_pdf_and_extract_questions(pdf_bytes):
         rect = page.rect
         mid_x = rect.width / 2.0
         
-        # 헤더/푸터 제외 높이 영역 설정 (상위 7.5% 단원제목/헤더 영역 제외, 하위 9% 푸터 제외)
+        # 헤더/푸터 제외 높이 영역 설정 (상위 7.5% 헤더/단원제외, 하위 7% 푸터 제외)
         header_limit = rect.height * 0.075
-        footer_limit = rect.height * 0.91
+        footer_limit = rect.height * 0.93
 
         blocks = page.get_text("blocks")
         
@@ -132,8 +132,8 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_y = img.height / q['page_height']
         
         mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
-        # 중앙 구분선 제거를 위한 안쪽 여백 (12pt 상당)
-        divider_margin = int(12 * scale_x)
+        # 중앙 구분선 제거를 위한 안쪽 여백 (6pt로 미세 조정하여 우측 선지 잘림 방지)
+        divider_margin = int(6 * scale_x)
 
         has_right_col = any(item['page'] == page_num and item['col'] == 1 for item in question_data)
         
@@ -159,12 +159,13 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 next_q_same_col = question_data[j]
                 break
                 
-        # 하단 자르기 위치 결정 (다음 문제 전 OR 실제 텍스트 끝 + 여백)
+        # 하단 자르기 위치 결정 (다음 문제 전 OR 실제 텍스트 끝 + 넉넉한 여백)
         if next_q_same_col:
-            crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 5)
+            # 다음 문제 시작 지점 직전까지 (오프셋 완화)
+            crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 2)
         else:
-            # 컬럼의 마지막 문제: 실제 내용 끝(max_y1) + 적절한 여백(20pt), 푸터 영역 제한
-            max_content_y = min(q['max_y1'] + 20, q['page_height'] * 0.91)
+            # 컬럼의 마지막 문제: 실제 내용 끝(max_y1) + 넉넉한 여백(+35pt로 확대), 푸터 영역 제한
+            max_content_y = min(q['max_y1'] + 35, q['page_height'] * 0.93)
             crop_bottom = min(img.height, int(max_content_y * scale_y))
 
         if crop_bottom > crop_top + 30 and crop_right > crop_left + 30:
@@ -379,7 +380,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 지문/보기(※)를 정밀 분석하여 여백 및 중앙 세로 구분선 없이 깔끔하게 자릅니다.")
+                st.info("💡 **PDF 지원 안내**: 지문/보기(※)를 정밀 분석하여 여백 및 하단 선지 잘림 없이 깔끔하게 자릅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
