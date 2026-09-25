@@ -6,7 +6,7 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageDraw
 import io
 
-# --- 1. 데이터베이스(DB) 초기화 (안정된 기본 구조) ---
+# --- 1. 데이터베이스(DB) 초기화 ---
 def init_db():
     conn = sqlite3.connect('wrong_answer_db.db')
     c = conn.cursor()
@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자르기 엔진 ---
+# --- 2. PDF 문제 자동 자르기 엔진 ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -329,40 +329,7 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 안정적인 인쇄 전용 CSS ---
-st.markdown("""
-    <style>
-    @media print {
-        header, footer, nav,
-        [data-testid="stHeader"],
-        [data-testid="stAppHeader"],
-        [data-testid="stSidebar"],
-        [data-testid="stToolbar"],
-        [data-testid="stDecoration"],
-        [data-testid="stStatusWidget"],
-        [data-testid="stElementToolbar"],
-        .stAppHeader, .stAppToolbar, button {
-            display: none !important;
-            visibility: hidden !important;
-            height: 0 !important;
-        }
-        body, .stApp {
-            background-color: white !important;
-            color: black !important;
-        }
-        .main .block-container {
-            padding: 0 !important;
-            margin: 0 !important;
-            max-width: 100% !important;
-        }
-        .element-container, .stColumn {
-            break-inside: avoid !important;
-        }
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# --- 5. 메인 UI ---
+# --- 4. 메인 화면 ---
 TEACHER_PASSWORD = "1234"
 
 if "admin_logged_in" not in st.session_state:
@@ -462,7 +429,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         with st.spinner("PDF 레이아웃 분석 및 문제 이미지 자동 분할 중..."):
                             hw_id, q_count = save_homework_from_pdf(hw_title.strip(), pdf_file)
                             if q_count > 0:
-                                st.success(f"✅ '{hw_title}' 등록 완료! 총 {q_count}문제가 저장되었습니다.")
+                                st.success(f"✅ '{hw_title}' 등록 완료! 총 {q_count}문제가 자동 자르기로 저장되었습니다.")
                                 
                                 st.markdown("---")
                                 st.markdown("### 🔍 잘라낸 문제 이미지 전체 미리보기")
@@ -473,7 +440,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                                         st.image(img_bytes, use_container_width=True)
                                         st.markdown("---")
                             else:
-                                st.error("PDF에서 문제 번호를 찾지 못했습니다. 이미지 직접 업로드 방식을 사용해 주세요.")
+                                st.error("PDF에서 문제 번호를 찾지 못했습니다. 스캔본(이미지형) PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
             
             else:
                 st.info("💡 **팁**: 캡처한 이미지 파일명을 1.png, 2.png 순으로 붙여 업로드하세요.")
@@ -567,7 +534,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     </div>
                 """, height=55)
 
-                # 인쇄용 헤더
+                # 오답노트 인쇄 영역 시작
                 st.markdown(f"""
                 <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
                     <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
