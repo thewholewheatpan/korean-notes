@@ -5,25 +5,17 @@ import re
 import fitz  # PyMuPDF
 from PIL import Image, ImageDraw
 import io
-import base64
 
-# --- 1. 데이터베이스(DB) 초기화 및 컬럼 자동 확장 ---
+# --- 1. 데이터베이스(DB) 초기화 (안정된 기본 구조) ---
 def init_db():
     conn = sqlite3.connect('wrong_answer_db.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS homeworks 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, created_at TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS questions 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, homework_id INTEGER, q_num INTEGER, image_data BLOB, is_2col INTEGER DEFAULT 0)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, homework_id INTEGER, q_num INTEGER, image_data BLOB)''')
     c.execute('''CREATE TABLE IF NOT EXISTS submissions 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, student_name TEXT, homework_id INTEGER, wrong_nums TEXT, submitted_at TEXT)''')
-    
-    # 기존 DB 호환을 위한 is_2col 컬럼 안전 추가
-    try:
-        c.execute("ALTER TABLE questions ADD COLUMN is_2col INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-
     conn.commit()
     conn.close()
 
@@ -34,11 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# 바이트 이미지를 HTML용 Base64로 변환
-def bytes_to_b64(b_data):
-    return "data:image/png;base64," + base64.b64encode(b_data).decode("utf-8")
-
-# --- 2. PDF 문제 정밀 자르기 (2단 연쇄 지문 감지 포함) ---
+# --- 2. PDF 문제 자르기 엔진 ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -181,11 +169,9 @@ def process_pdf_and_extract_questions(pdf_bytes):
 
         p_info = q.get('passage_info')
         passage_img = None
-        is_2col_spanned = False
         
         if p_info:
             if p_info.get('is_2col'):
-                is_2col_spanned = True
                 c0_top = max(0, int(p_info['col0_y0'] * scale_y) - 5)
                 c0_bot = min(img.height, int(p_info['col0_y1'] * scale_y))
                 left_p = img.crop((0, c0_top, mid_pixel_x - 6, c0_bot))
@@ -236,7 +222,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
 
             img_byte_arr = io.BytesIO()
             final_img.save(img_byte_arr, format='PNG')
-            extracted_questions.append((q_num, img_byte_arr.getvalue(), is_2col_spanned))
+            extracted_questions.append((q_num, img_byte_arr.getvalue()))
 
     extracted_questions.sort(key=lambda x: x[0])
     return extracted_questions
@@ -253,9 +239,9 @@ def save_homework_from_pdf(title, pdf_file):
     c.execute("INSERT INTO homeworks (title, created_at) VALUES (?, ?)", (title, now))
     hw_id = c.lastrowid
     
-    for q_num, img_bytes, is_2col in questions:
-        c.execute("INSERT INTO questions (homework_id, q_num, image_data, is_2col) VALUES (?, ?, ?, ?)", 
-                  (hw_id, q_num, img_bytes, 1 if is_2col else 0))
+    for q_num, img_bytes in questions:
+        c.execute("INSERT INTO questions (homework_id, q_num, image_data) VALUES (?, ?, ?)", 
+                  (hw_id, q_num, img_bytes))
         
     conn.commit()
     conn.close()
@@ -271,7 +257,7 @@ def save_homework_from_images(title, uploaded_files):
     sorted_files = sorted(uploaded_files, key=natural_sort_key)
     for idx, file in enumerate(sorted_files, start=1):
         image_bytes = file.read()
-        c.execute("INSERT INTO questions (homework_id, q_num, image_data, is_2col) VALUES (?, ?, ?, 0)", 
+        c.execute("INSERT INTO questions (homework_id, q_num, image_data) VALUES (?, ?, ?)", 
                   (hw_id, idx, image_bytes))
         
     conn.commit()
@@ -337,13 +323,46 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn = sqlite3.connect('wrong_answer_db.db')
     c = conn.cursor()
     placeholders = ','.join('?' for _ in wrong_nums_list)
-    query = f"SELECT q_num, image_data, is_2col FROM questions WHERE homework_id = ? AND q_num IN ({placeholders}) ORDER BY q_num"
+    query = f"SELECT q_num, image_data FROM questions WHERE homework_id = ? AND q_num IN ({placeholders}) ORDER BY q_num"
     c.execute(query, [hw_id] + wrong_nums_list)
     data = c.fetchall()
     conn.close()
     return data
 
-# --- 4. 메인 화면 ---
+# --- 4. 안정적인 인쇄 전용 CSS ---
+st.markdown("""
+    <style>
+    @media print {
+        header, footer, nav,
+        [data-testid="stHeader"],
+        [data-testid="stAppHeader"],
+        [data-testid="stSidebar"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
+        [data-testid="stElementToolbar"],
+        .stAppHeader, .stAppToolbar, button {
+            display: none !important;
+            visibility: hidden !important;
+            height: 0 !important;
+        }
+        body, .stApp {
+            background-color: white !important;
+            color: black !important;
+        }
+        .main .block-container {
+            padding: 0 !important;
+            margin: 0 !important;
+            max-width: 100% !important;
+        }
+        .element-container, .stColumn {
+            break-inside: avoid !important;
+        }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- 5. 메인 UI ---
 TEACHER_PASSWORD = "1234"
 
 if "admin_logged_in" not in st.session_state:
@@ -443,18 +462,18 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         with st.spinner("PDF 레이아웃 분석 및 문제 이미지 자동 분할 중..."):
                             hw_id, q_count = save_homework_from_pdf(hw_title.strip(), pdf_file)
                             if q_count > 0:
-                                st.success(f"✅ '{hw_title}' 등록 완료! 총 {q_count}문제가 자동 자르기로 저장되었습니다.")
+                                st.success(f"✅ '{hw_title}' 등록 완료! 총 {q_count}문제가 저장되었습니다.")
                                 
                                 st.markdown("---")
                                 st.markdown("### 🔍 잘라낸 문제 이미지 전체 미리보기")
                                 preview_images = get_wrong_questions_images(hw_id, list(range(1, q_count + 1)))
                                 preview_cols = st.columns(2)
-                                for idx, (q_num, img_bytes, is_2col) in enumerate(preview_images):
+                                for idx, (q_num, img_bytes) in enumerate(preview_images):
                                     with preview_cols[idx % 2]:
                                         st.image(img_bytes, use_container_width=True)
                                         st.markdown("---")
                             else:
-                                st.error("PDF에서 문제 번호를 찾지 못했습니다. 스캔본(이미지형) PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
+                                st.error("PDF에서 문제 번호를 찾지 못했습니다. 이미지 직접 업로드 방식을 사용해 주세요.")
             
             else:
                 st.info("💡 **팁**: 캡처한 이미지 파일명을 1.png, 2.png 순으로 붙여 업로드하세요.")
@@ -498,7 +517,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_imgs = get_wrong_questions_images(hw_id, list(range(1, q_count + 1)))
                         if hw_imgs:
                             img_cols = st.columns(2)
-                            for idx, (q_num, img_bytes, is_2col) in enumerate(hw_imgs):
+                            for idx, (q_num, img_bytes) in enumerate(hw_imgs):
                                 with img_cols[idx % 2]:
                                     st.image(img_bytes, use_container_width=True)
                                     st.markdown("---")
@@ -507,7 +526,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 (완벽한 인쇄 영역 격리 & 2단 연쇄 지문 단독 페이지 지원) ---
+        # --- [탭 3] 개인별 오답노트 인쇄 ---
         with teacher_tab3:
             st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
             
@@ -531,68 +550,10 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 부모창 DOM에 CSS 격리 스타일 주입 후 인쇄 트리거
+                # 인쇄 버튼
                 st.components.v1.html("""
-                    <script>
-                    function triggerPrint() {
-                        try {
-                            var parentDoc = window.parent.document;
-                            var styleId = 'custom-print-style-injected';
-                            
-                            var existingStyle = parentDoc.getElementById(styleId);
-                            if (existingStyle) {
-                                existingStyle.remove();
-                            }
-                            
-                            var style = parentDoc.createElement('style');
-                            style.id = styleId;
-                            style.innerHTML = `
-                                @media print {
-                                    /* 1. 페이지 전체 요소 시각적 숨김 */
-                                    body, body * {
-                                        visibility: hidden !important;
-                                    }
-
-                                    /* 2. 오답노트 프린트 영역 및 그 하위 요소만 복원 */
-                                    .printable-area, .printable-area * {
-                                        visibility: visible !important;
-                                    }
-
-                                    /* 3. 프린트 영역을 용지 맨 꼭대기(0,0)에 강제 배치 */
-                                    .printable-area {
-                                        position: absolute !important;
-                                        left: 0 !important;
-                                        top: 0 !important;
-                                        width: 100% !important;
-                                        margin: 0 !important;
-                                        padding: 0 !important;
-                                    }
-
-                                    /* 4. 2단 걸친 긴 지문 문제는 항상 새로운 단독 페이지로 넘김 */
-                                    .page-break-before {
-                                        page-break-before: always !important;
-                                        break-before: page !important;
-                                    }
-
-                                    .question-card {
-                                        break-inside: avoid !important;
-                                        page-break-inside: avoid !important;
-                                    }
-
-                                    @page {
-                                        margin: 10mm;
-                                    }
-                                }
-                            `;
-                            parentDoc.head.appendChild(style);
-                        } catch(e) {
-                            console.log("Print injection note:", e);
-                        }
-                        window.parent.print();
-                    }
-                    </script>
                     <div style="text-align: center;">
-                        <button onclick="triggerPrint()" style="
+                        <button onclick="window.parent.print()" style="
                             background-color: #1e88e5;
                             color: white;
                             padding: 12px 28px;
@@ -606,59 +567,21 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     </div>
                 """, height=55)
 
+                # 인쇄용 헤더
+                st.markdown(f"""
+                <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
+                    <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
+                    <h3 style="margin: 8px 0 0 0; color: #333; font-size: 18px;">
+                        학생 이름: <span style="color: #1e88e5;"><b>{student_name}</b></span> &nbsp;|&nbsp; 숙제명: <b>{hw_title}</b>
+                    </h3>
+                </div>
+                """, unsafe_allow_html=True)
+                
                 images = get_wrong_questions_images(hw_id, wrong_list)
                 
                 if images:
-                    # HTML 기반 깔끔한 레이아웃 구성
-                    html_content = f"""
-                    <div class="printable-area">
-                        <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
-                            <h2 style="margin: 0; font-size: 26px; color: #111;">📄 맞춤 오답노트</h2>
-                            <h3 style="margin: 8px 0 0 0; color: #333; font-size: 18px;">
-                                학생 이름: <span style="color: #1e88e5;"><b>{student_name}</b></span> &nbsp;|&nbsp; 숙제명: <b>{hw_title}</b>
-                            </h3>
-                        </div>
-                    """
-                    
-                    pending_1col = []
-                    
-                    def render_1col_grid(items):
-                        if not items:
-                            return ""
-                        grid_html = '<div style="display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 20px;">'
-                        for q_num, img_bytes, _ in items:
-                            b64 = bytes_to_b64(img_bytes)
-                            grid_html += f'''
-                                <div class="question-card" style="flex: 1 1 calc(50% - 15px); min-width: 45%; box-sizing: border-box;">
-                                    <img src="{b64}" style="width: 100%; height: auto; display: block; border-bottom: 1px dashed #ccc; padding-bottom: 10px; margin-bottom: 10px;" />
-                                </div>
-                            '''
-                        if len(items) % 2 == 1:
-                            grid_html += '<div style="flex: 1 1 calc(50% - 15px); min-width: 45%;"></div>'
-                        grid_html += '</div>'
-                        return grid_html
-
-                    for q_num, img_bytes, is_2col in images:
-                        if is_2col:
-                            # 2단 지문 문제 등장 시 기존 1단 모아둔 문제들을 먼저 렌더링
-                            if pending_1col:
-                                html_content += render_1col_grid(pending_1col)
-                                pending_1col = []
-                            
-                            # 2단 지문 문제는 단독 새 페이지(page-break-before)에 100% 가로폭 배치
-                            b64 = bytes_to_b64(img_bytes)
-                            html_content += f'''
-                                <div class="question-card page-break-before" style="width: 100%; margin-top: 15px; margin-bottom: 25px;">
-                                    <img src="{b64}" style="width: 100%; height: auto; display: block; border-bottom: 1px dashed #ccc; padding-bottom: 10px;" />
-                                </div>
-                            '''
-                        else:
-                            pending_1col.append((q_num, img_bytes, is_2col))
-
-                    if pending_1col:
-                        html_content += render_1col_grid(pending_1col)
-
-                    html_content += "</div>"
-
-                    # 오답노트 화면 출력
-                    st.markdown(html_content, unsafe_allow_html=True)
+                    cols_print = st.columns(2)
+                    for idx, (q_num, img_bytes) in enumerate(images):
+                        with cols_print[idx % 2]:
+                            st.image(img_bytes, use_container_width=True)
+                            st.markdown("---")
