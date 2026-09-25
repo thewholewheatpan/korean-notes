@@ -3,7 +3,7 @@ import sqlite3
 import datetime
 import re
 import fitz  # PyMuPDF
-from PIL import Image
+from PIL import Image, ImageDraw
 import io
 
 # --- 1. 데이터베이스(DB) 초기화 ---
@@ -26,11 +26,10 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (타이트한 좌우 여백 적용) ---
+# --- 2. PDF 문제 정밀 자르기 (타이트한 단격리 & 2단 연쇄 지문 합성 엔진) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
-    
     expected_q_num = None
 
     for page_num in range(len(doc)):
@@ -48,40 +47,30 @@ def process_pdf_and_extract_questions(pdf_bytes):
         
         for b in blocks:
             x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
-            
             if y0 >= footer_limit or y1 <= header_limit:
                 continue
-            if re.match(r'^-\s*\d+\s*-$', text):
-                continue
-            if re.match(r'^\d+[\-~]\d+', text):
+            if re.match(r'^-\s*\d+\s*-$', text) or re.match(r'^\d+[\-~]\d+', text):
                 continue
                 
-            if x0 < mid_x:
+            # 중앙선(mid_x) 기준 엄격한 단 분리
+            if x0 < mid_x and x1 <= mid_x + 10:
                 left_blocks.append(b)
-            else:
+            elif x0 >= mid_x - 10:
                 right_blocks.append(b)
 
-        # 각 단의 실제 텍스트 영역을 측정하여 타이트한 좌우 경계 설정
-        left_x0 = min([b[0] for b in left_blocks]) - 4 if left_blocks else 0
-        left_x1 = max([b[2] for b in left_blocks]) + 4 if left_blocks else mid_x - 5
-        
-        right_x0 = min([b[0] for b in right_blocks]) - 4 if right_blocks else mid_x + 5
-        right_x1 = max([b[2] for b in right_blocks]) + 4 if right_blocks else rect.width
+        col0_passage = None
 
         for col, col_blocks in enumerate([left_blocks, right_blocks]):
             col_blocks.sort(key=lambda x: x[1])
-            
             current_passage_y0 = None
             current_q = None
 
             for b in col_blocks:
                 x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
-
                 if re.match(r'^\d+[\-~]\d+', text):
                     continue
 
                 match = re.match(r'^\s*(\d{1,2})\.\s*', text)
-                
                 is_real_question = False
                 q_num = None
 
@@ -105,24 +94,34 @@ def process_pdf_and_extract_questions(pdf_bytes):
 
                 if is_passage and current_passage_y0 is None and not is_real_question:
                     current_passage_y0 = y0
+                    if col == 0:
+                        col0_passage = {'y0': y0, 'y1': footer_limit}
 
                 if is_real_question:
-                    start_y0 = current_passage_y0 if current_passage_y0 is not None else y0
-                    current_passage_y0 = None
-
-                    col_x0 = left_x0 if col == 0 else right_x0
-                    col_x1 = left_x1 if col == 0 else right_x1
+                    passage_info = None
+                    if current_passage_y0 is not None:
+                        passage_info = {'is_2col': False, 'col': col, 'y0': current_passage_y0, 'y1': y0}
+                        current_passage_y0 = None
+                    elif col == 1 and col0_passage is not None:
+                        # 2단 연결 지문 감지 (왼쪽 단 지문 + 오른쪽 단 지문)
+                        passage_info = {
+                            'is_2col': True,
+                            'col0_y0': col0_passage['y0'],
+                            'col0_y1': col0_passage['y1'],
+                            'col1_y0': col_blocks[0][1] if col_blocks else header_limit,
+                            'col1_y1': y0
+                        }
+                        col0_passage = None
 
                     current_q = {
                         'q_num': q_num,
                         'page': page_num,
                         'col': col,
-                        'x0': col_x0,
-                        'x1': col_x1,
-                        'y0': start_y0,
+                        'y0': y0,
                         'max_y1': y1,
                         'page_width': rect.width,
-                        'page_height': rect.height
+                        'page_height': rect.height,
+                        'passage_info': passage_info
                     }
                     question_data.append(current_q)
 
@@ -144,11 +143,67 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_x = img.width / q['page_width']
         scale_y = img.height / q['page_height']
         
-        # 좌우 여백을 텍스트 영역에 맞추어 균일하고 타이트하게 컷팅
-        crop_left = max(0, int(q['x0'] * scale_x))
-        crop_right = min(img.width, int(q['x1'] * scale_x))
+        mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
 
-        crop_top = max(0, int(q['y0'] * scale_y) - 10)
+        # 해당 문제만의 실제 텍스트 영역 추출 (타이트 크롭 계산)
+        page_blocks = page.get_text("blocks")
+        q_blocks = []
+        for b in page_blocks:
+            bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
+            if col == 0 and bx1 > (q['page_width'] / 2.0):
+                continue
+            if col == 1 and bx0 < (q['page_width'] / 2.0):
+                continue
+            if by0 >= q['y0'] - 5 and by1 <= q['max_y1'] + 10:
+                q_blocks.append(b)
+
+        if q_blocks:
+            min_x = min([b[0] for b in q_blocks]) - 4
+            max_x = max([b[2] for b in q_blocks]) + 4
+        else:
+            min_x = 0 if col == 0 else (q['page_width'] / 2.0)
+            max_x = (q['page_width'] / 2.0) if col == 0 else q['page_width']
+
+        # 좌우 엄격 경계 한계선 설정 (절대 다른 단 침범 불가)
+        if col == 0:
+            crop_left = max(0, int(min_x * scale_x))
+            crop_right = min(mid_pixel_x - 6, int(max_x * scale_x))
+        else:
+            crop_left = max(mid_pixel_x + 6, int(min_x * scale_x))
+            crop_right = min(img.width, int(max_x * scale_x))
+
+        # 지문 영역 가로/세로 병합 처리
+        p_info = q.get('passage_info')
+        passage_img = None
+        
+        if p_info:
+            if p_info.get('is_2col'):
+                # 2단에 걸친 지문 병합 (좌/우 지문 합성)
+                c0_top = max(0, int(p_info['col0_y0'] * scale_y) - 5)
+                c0_bot = min(img.height, int(p_info['col0_y1'] * scale_y))
+                left_p = img.crop((0, c0_top, mid_pixel_x - 6, c0_bot))
+
+                c1_top = max(0, int(p_info['col1_y0'] * scale_y) - 5)
+                c1_bot = min(img.height, int(p_info['col1_y1'] * scale_y) - 5)
+                right_p = img.crop((mid_pixel_x + 6, c1_top, img.width, c1_bot))
+
+                h = max(left_p.height, right_p.height)
+                w = left_p.width + right_p.width + 12
+                stitched = Image.new("RGB", (w, h), (255, 255, 255))
+                stitched.paste(left_p, (0, 0))
+                
+                # 2단 구분선 그리기
+                draw = ImageDraw.Draw(stitched)
+                draw.line([(left_p.width + 6, 0), (left_p.width + 6, h)], fill=(200, 200, 200), width=1)
+                stitched.paste(right_p, (left_p.width + 12, 0))
+                passage_img = stitched
+            else:
+                p_top = max(0, int(p_info['y0'] * scale_y) - 5)
+                p_bot = min(img.height, int(p_info['y1'] * scale_y))
+                passage_img = img.crop((crop_left, p_top, crop_right, p_bot))
+
+        # 문제 본문 크롭
+        crop_top = max(0, int(q['y0'] * scale_y) - 8)
         
         next_q_same_col = None
         for j in range(i + 1, len(question_data)):
@@ -162,10 +217,21 @@ def process_pdf_and_extract_questions(pdf_bytes):
             max_content_y = min(q['max_y1'] + 35, q['page_height'] * 0.93)
             crop_bottom = min(img.height, int(max_content_y * scale_y))
 
-        if crop_bottom > crop_top + 30 and crop_right > crop_left + 30:
-            cropped_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        if crop_bottom > crop_top + 20 and crop_right > crop_left + 20:
+            q_body_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+            
+            # 지문과 문제 본문 수직 결합
+            if passage_img:
+                target_w = max(passage_img.width, q_body_img.width)
+                combined_h = passage_img.height + q_body_img.height + 15
+                final_img = Image.new("RGB", (target_w, combined_h), (255, 255, 255))
+                final_img.paste(passage_img, (0, 0))
+                final_img.paste(q_body_img, (0, passage_img.height + 15))
+            else:
+                final_img = q_body_img
+
             img_byte_arr = io.BytesIO()
-            cropped_img.save(img_byte_arr, format='PNG')
+            final_img.save(img_byte_arr, format='PNG')
             extracted_questions.append((q_num, img_byte_arr.getvalue()))
 
     extracted_questions.sort(key=lambda x: x[0])
@@ -273,48 +339,7 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 인쇄 전용 CSS (Streamlit 상단 바 및 헤더 완전 숨김) ---
-st.markdown("""
-    <style>
-    @media print {
-        /* Streamlit 최상단 헤더, 툴바, 사이드바 등 인쇄 시 완벽 숨김 */
-        [data-testid="stHeader"],
-        [data-testid="stSidebar"],
-        [data-testid="stToolbar"],
-        [data-testid="stDecoration"],
-        [data-testid="stStatusWidget"],
-        [data-testid="stElementToolbar"],
-        [data-testid="stAppHeader"],
-        header,
-        footer,
-        .stAppHeader,
-        .stAppToolbar,
-        .stTabs [role="tablist"],
-        .no-print,
-        button,
-        iframe {
-            display: none !important;
-            visibility: hidden !important;
-            height: 0 !important;
-        }
-
-        body, .stApp {
-            background-color: white !important;
-            color: black !important;
-        }
-        .main .block-container {
-            padding: 0 !important;
-            margin: 0 !important;
-            max-width: 100% !important;
-        }
-        .element-container, .stColumn {
-            break-inside: avoid !important;
-        }
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# --- 5. 선생님 인증 암호 및 로그인 상태 관리 ---
+# --- 4. 메인 화면 ---
 TEACHER_PASSWORD = "9735"
 
 if "admin_logged_in" not in st.session_state:
@@ -402,7 +427,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 순차적 문제 번호를 추적하여 지문 및 주관식 <조건>까지 깔끔하게 자릅니다.")
+                st.info("💡 **PDF 지원 안내**: 순차적 문제 번호를 추적하여 2단 연쇄 지문까지 자동 결합해 자릅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
@@ -422,7 +447,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                                 preview_cols = st.columns(2)
                                 for idx, (q_num, img_bytes) in enumerate(preview_images):
                                     with preview_cols[idx % 2]:
-                                        st.markdown(f"**📍 문제 {q_num}번**")
                                         st.image(img_bytes, use_container_width=True)
                                         st.markdown("---")
                             else:
@@ -441,7 +465,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_id = save_homework_from_images(hw_title.strip(), uploaded_files)
                         st.success(f"✅ '{hw_title}' 등록 완료! 총 {len(uploaded_files)}문제가 저장되었습니다.")
         
-        # --- [탭 2] 등록된 숙제 목록 및 문제 이미지 보기 ---
+        # --- [탭 2] 등록된 숙제 목록 ---
         with teacher_tab2:
             st.markdown("### 📚 등록된 숙제 목록 및 삭제 관리")
             
@@ -472,7 +496,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                             img_cols = st.columns(2)
                             for idx, (q_num, img_bytes) in enumerate(hw_imgs):
                                 with img_cols[idx % 2]:
-                                    st.markdown(f"**📍 문제 {q_num}번**")
                                     st.image(img_bytes, use_container_width=True)
                                     st.markdown("---")
                         else:
@@ -480,7 +503,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 ---
+        # --- [탭 3] 개인별 오답노트 인쇄 (JavaScript 부모창 인쇄 스타일 강력 주입) ---
         with teacher_tab3:
             st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
             
@@ -504,10 +527,56 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 부모창 전체 인쇄 버튼
+                # JavaScript를 이용해 부모창 DOM에 @media print 스타일 주입 후 인쇄
                 st.components.v1.html("""
+                    <script>
+                    function triggerPrint() {
+                        try {
+                            var parentDoc = window.parent.document;
+                            var styleId = 'custom-print-style-injected';
+                            if (!parentDoc.getElementById(styleId)) {
+                                var style = parentDoc.createElement('style');
+                                style.id = styleId;
+                                style.innerHTML = `
+                                    @media print {
+                                        header, footer, nav, iframe,
+                                        [data-testid="stHeader"],
+                                        [data-testid="stAppHeader"],
+                                        [data-testid="stSidebar"],
+                                        [data-testid="stToolbar"],
+                                        [data-testid="stDecoration"],
+                                        [data-testid="stStatusWidget"],
+                                        [data-testid="stElementToolbar"],
+                                        .stAppHeader,
+                                        .stAppToolbar,
+                                        #root > div:nth-child(1) > header {
+                                            display: none !important;
+                                            visibility: hidden !important;
+                                            height: 0 !important;
+                                            opacity: 0 !important;
+                                        }
+                                        body, .stApp {
+                                            background-color: white !important;
+                                            color: black !important;
+                                            margin: 0 !important;
+                                            padding: 0 !important;
+                                        }
+                                        .main .block-container {
+                                            padding: 0 !important;
+                                            margin: 0 !important;
+                                        }
+                                    }
+                                `;
+                                parentDoc.head.appendChild(style);
+                            }
+                        } catch(e) {
+                            console.log("Parent injection note:", e);
+                        }
+                        window.parent.print();
+                    }
+                    </script>
                     <div style="text-align: center;">
-                        <button onclick="window.parent.print()" style="
+                        <button onclick="triggerPrint()" style="
                             background-color: #1e88e5;
                             color: white;
                             padding: 12px 28px;
