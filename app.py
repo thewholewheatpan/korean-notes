@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (5번 선지 아래 여백 축소 수정) ---
+# --- 2. PDF 문제 자동 자르기 (하단 여백 대폭 축소 수정) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -160,18 +160,16 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 next_q_same_col = question_data[j]
                 break
                 
-        # 5번 선지가 있는 객관식 문제는 아래 여백을 10pt로 최소화
-        if q.get('has_opt_5', False):
-            max_content_y = q['max_y1'] + 10
-            if next_q_same_col:
-                max_content_y = min(next_q_same_col['y0'] - 2, max_content_y)
-            crop_bottom = min(img.height, int(max_content_y * scale_y))
+        # 하단 여백 대폭 축소 (기존 기준의 절반 이하인 +4pt / +10pt만 유지)
+        extra_margin = 4 if q.get('has_opt_5', False) else 10
+        max_content_y = q['max_y1'] + extra_margin
+
+        if next_q_same_col:
+            max_content_y = min(next_q_same_col['y0'] - 2, max_content_y)
         else:
-            if next_q_same_col:
-                crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 2)
-            else:
-                max_content_y = min(q['max_y1'] + 35, q['page_height'] * 0.93)
-                crop_bottom = min(img.height, int(max_content_y * scale_y))
+            max_content_y = min(max_content_y, q['page_height'] * 0.93)
+
+        crop_bottom = min(img.height, int(max_content_y * scale_y))
 
         if crop_bottom > crop_top + 30 and crop_right > crop_left + 30:
             cropped_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
@@ -434,7 +432,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                                     with preview_cols[idx % 2]:
                                         st.markdown(f"**📍 문제 {q_num}번**")
                                         st.image(img_bytes, use_container_width=True)
-                                        st.markdown("---")
                             else:
                                 st.error("PDF에서 문제 번호를 찾지 못했습니다. 스캔본(이미지형) PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
             
@@ -484,7 +481,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                                 with img_cols[idx % 2]:
                                     st.markdown(f"**📍 문제 {q_num}번**")
                                     st.image(img_bytes, use_container_width=True)
-                                    st.markdown("---")
                         else:
                             st.write("저장된 문제 이미지가 없습니다.")
 
@@ -546,4 +542,3 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     for idx, (q_num, img_bytes) in enumerate(images):
                         with cols_print[idx % 2]:
                             st.image(img_bytes, use_container_width=True)
-                            st.markdown("---")
