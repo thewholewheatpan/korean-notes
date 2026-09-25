@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 엔진 ---
+# --- 2. PDF 문제 정밀 자르기 (타이트한 단격리 & 2단 연쇄 지문 합성 엔진) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -41,6 +41,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
         footer_limit = rect.height * 0.93
 
         blocks = page.get_text("blocks")
+        
         left_blocks = []
         right_blocks = []
         
@@ -51,6 +52,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
             if re.match(r'^-\s*\d+\s*-$', text) or re.match(r'^\d+[\-~]\d+', text):
                 continue
                 
+            # 중앙선(mid_x) 기준 엄격한 단 분리
             if x0 < mid_x and x1 <= mid_x + 10:
                 left_blocks.append(b)
             elif x0 >= mid_x - 10:
@@ -101,6 +103,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
                         passage_info = {'is_2col': False, 'col': col, 'y0': current_passage_y0, 'y1': y0}
                         current_passage_y0 = None
                     elif col == 1 and col0_passage is not None:
+                        # 2단 연결 지문 감지 (왼쪽 단 지문 + 오른쪽 단 지문)
                         passage_info = {
                             'is_2col': True,
                             'col0_y0': col0_passage['y0'],
@@ -142,6 +145,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
         
         mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
 
+        # 해당 문제만의 실제 텍스트 영역 추출 (타이트 크롭 계산)
         page_blocks = page.get_text("blocks")
         q_blocks = []
         for b in page_blocks:
@@ -160,6 +164,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
             min_x = 0 if col == 0 else (q['page_width'] / 2.0)
             max_x = (q['page_width'] / 2.0) if col == 0 else q['page_width']
 
+        # 좌우 엄격 경계 한계선 설정 (절대 다른 단 침범 불가)
         if col == 0:
             crop_left = max(0, int(min_x * scale_x))
             crop_right = min(mid_pixel_x - 6, int(max_x * scale_x))
@@ -167,11 +172,13 @@ def process_pdf_and_extract_questions(pdf_bytes):
             crop_left = max(mid_pixel_x + 6, int(min_x * scale_x))
             crop_right = min(img.width, int(max_x * scale_x))
 
+        # 지문 영역 가로/세로 병합 처리
         p_info = q.get('passage_info')
         passage_img = None
         
         if p_info:
             if p_info.get('is_2col'):
+                # 2단에 걸친 지문 병합 (좌/우 지문 합성)
                 c0_top = max(0, int(p_info['col0_y0'] * scale_y) - 5)
                 c0_bot = min(img.height, int(p_info['col0_y1'] * scale_y))
                 left_p = img.crop((0, c0_top, mid_pixel_x - 6, c0_bot))
@@ -185,6 +192,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 stitched = Image.new("RGB", (w, h), (255, 255, 255))
                 stitched.paste(left_p, (0, 0))
                 
+                # 2단 구분선 그리기
                 draw = ImageDraw.Draw(stitched)
                 draw.line([(left_p.width + 6, 0), (left_p.width + 6, h)], fill=(200, 200, 200), width=1)
                 stitched.paste(right_p, (left_p.width + 12, 0))
@@ -194,6 +202,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 p_bot = min(img.height, int(p_info['y1'] * scale_y))
                 passage_img = img.crop((crop_left, p_top, crop_right, p_bot))
 
+        # 문제 본문 크롭
         crop_top = max(0, int(q['y0'] * scale_y) - 8)
         
         next_q_same_col = None
@@ -211,6 +220,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
         if crop_bottom > crop_top + 20 and crop_right > crop_left + 20:
             q_body_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
             
+            # 지문과 문제 본문 수직 결합
             if passage_img:
                 target_w = max(passage_img.width, q_body_img.width)
                 combined_h = passage_img.height + q_body_img.height + 15
@@ -493,7 +503,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 ---
+        # --- [탭 3] 개인별 오답노트 인쇄 (JavaScript 부모창 인쇄 스타일 강력 주입) ---
         with teacher_tab3:
             st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
             
@@ -517,10 +527,56 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 인쇄 버튼
+                # JavaScript를 이용해 부모창 DOM에 @media print 스타일 주입 후 인쇄
                 st.components.v1.html("""
+                    <script>
+                    function triggerPrint() {
+                        try {
+                            var parentDoc = window.parent.document;
+                            var styleId = 'custom-print-style-injected';
+                            if (!parentDoc.getElementById(styleId)) {
+                                var style = parentDoc.createElement('style');
+                                style.id = styleId;
+                                style.innerHTML = `
+                                    @media print {
+                                        header, footer, nav, iframe,
+                                        [data-testid="stHeader"],
+                                        [data-testid="stAppHeader"],
+                                        [data-testid="stSidebar"],
+                                        [data-testid="stToolbar"],
+                                        [data-testid="stDecoration"],
+                                        [data-testid="stStatusWidget"],
+                                        [data-testid="stElementToolbar"],
+                                        .stAppHeader,
+                                        .stAppToolbar,
+                                        #root > div:nth-child(1) > header {
+                                            display: none !important;
+                                            visibility: hidden !important;
+                                            height: 0 !important;
+                                            opacity: 0 !important;
+                                        }
+                                        body, .stApp {
+                                            background-color: white !important;
+                                            color: black !important;
+                                            margin: 0 !important;
+                                            padding: 0 !important;
+                                        }
+                                        .main .block-container {
+                                            padding: 0 !important;
+                                            margin: 0 !important;
+                                        }
+                                    }
+                                `;
+                                parentDoc.head.appendChild(style);
+                            }
+                        } catch(e) {
+                            console.log("Parent injection note:", e);
+                        }
+                        window.parent.print();
+                    }
+                    </script>
                     <div style="text-align: center;">
-                        <button onclick="window.parent.print()" style="
+                        <button onclick="triggerPrint()" style="
                             background-color: #1e88e5;
                             color: white;
                             padding: 12px 28px;
@@ -534,7 +590,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     </div>
                 """, height=55)
 
-                # 오답노트 인쇄 영역 시작
+                # 인쇄용 헤더
                 st.markdown(f"""
                 <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
                     <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
