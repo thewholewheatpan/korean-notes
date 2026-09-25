@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (순차적 문제 번호 기반 정밀 추출) ---
+# --- 2. PDF 문제 자동 자르기 (타이트한 좌우 여백 적용) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -60,6 +60,13 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 left_blocks.append(b)
             else:
                 right_blocks.append(b)
+
+        # 각 단의 실제 텍스트 영역을 측정하여 타이트한 좌우 경계 설정
+        left_x0 = min([b[0] for b in left_blocks]) - 4 if left_blocks else 0
+        left_x1 = max([b[2] for b in left_blocks]) + 4 if left_blocks else mid_x - 5
+        
+        right_x0 = min([b[0] for b in right_blocks]) - 4 if right_blocks else mid_x + 5
+        right_x1 = max([b[2] for b in right_blocks]) + 4 if right_blocks else rect.width
 
         for col, col_blocks in enumerate([left_blocks, right_blocks]):
             col_blocks.sort(key=lambda x: x[1])
@@ -103,10 +110,15 @@ def process_pdf_and_extract_questions(pdf_bytes):
                     start_y0 = current_passage_y0 if current_passage_y0 is not None else y0
                     current_passage_y0 = None
 
+                    col_x0 = left_x0 if col == 0 else right_x0
+                    col_x1 = left_x1 if col == 0 else right_x1
+
                     current_q = {
                         'q_num': q_num,
                         'page': page_num,
                         'col': col,
+                        'x0': col_x0,
+                        'x1': col_x1,
                         'y0': start_y0,
                         'max_y1': y1,
                         'page_width': rect.width,
@@ -132,21 +144,9 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_x = img.width / q['page_width']
         scale_y = img.height / q['page_height']
         
-        mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
-        divider_margin = int(6 * scale_x)
-
-        has_right_col = any(item['page'] == page_num and item['col'] == 1 for item in question_data)
-        
-        if has_right_col:
-            if col == 0:
-                crop_left = 0
-                crop_right = max(0, mid_pixel_x - divider_margin)
-            else:
-                crop_left = min(img.width, mid_pixel_x + divider_margin)
-                crop_right = img.width
-        else:
-            crop_left = 0
-            crop_right = img.width
+        # 좌우 여백을 텍스트 영역에 맞추어 균일하고 타이트하게 컷팅
+        crop_left = max(0, int(q['x0'] * scale_x))
+        crop_right = min(img.width, int(q['x1'] * scale_x))
 
         crop_top = max(0, int(q['y0'] * scale_y) - 10)
         
@@ -273,26 +273,32 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 인쇄 전용 CSS (상단 관리자 메뉴, 탭, 버튼, iframe 자동 숨김) ---
+# --- 4. 인쇄 전용 CSS (Streamlit 상단 바 및 헤더 완전 숨김) ---
 st.markdown("""
     <style>
     @media print {
-        /* Streamlit 기본 UI 및 인쇄 버튼 영역 완전 제외 */
+        /* Streamlit 최상단 헤더, 툴바, 사이드바 등 인쇄 시 완벽 숨김 */
         [data-testid="stHeader"],
         [data-testid="stSidebar"],
         [data-testid="stToolbar"],
         [data-testid="stDecoration"],
         [data-testid="stStatusWidget"],
+        [data-testid="stElementToolbar"],
+        [data-testid="stAppHeader"],
+        header,
+        footer,
+        .stAppHeader,
+        .stAppToolbar,
         .stTabs [role="tablist"],
         .no-print,
         button,
-        iframe,
-        header,
-        footer {
+        iframe {
             display: none !important;
+            visibility: hidden !important;
+            height: 0 !important;
         }
 
-        body {
+        body, .stApp {
             background-color: white !important;
             color: black !important;
         }
@@ -474,7 +480,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 (부모창 인쇄 기능 적용) ---
+        # --- [탭 3] 개인별 오답노트 인쇄 ---
         with teacher_tab3:
             st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
             
@@ -498,7 +504,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 부모창 전체 인쇄 실행 버튼 (window.parent.print())
+                # 부모창 전체 인쇄 버튼
                 st.components.v1.html("""
                     <div style="text-align: center;">
                         <button onclick="window.parent.print()" style="
@@ -515,7 +521,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     </div>
                 """, height=55)
 
-                # 인쇄용 상단 헤더
+                # 인쇄용 헤더
                 st.markdown(f"""
                 <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
                     <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
@@ -527,7 +533,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 images = get_wrong_questions_images(hw_id, wrong_list)
                 
-                # '문제 n번' 글자 완전히 제거된 2단 시험지 출력
                 if images:
                     cols_print = st.columns(2)
                     for idx, (q_num, img_bytes) in enumerate(images):
