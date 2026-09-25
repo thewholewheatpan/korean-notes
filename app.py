@@ -31,7 +31,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
     
-    # 전체 PDF 기준 다음 예상 문제 번호 (1번부터 순차 탐색)
     expected_q_num = None
 
     for page_num in range(len(doc)):
@@ -39,7 +38,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
         rect = page.rect
         mid_x = rect.width / 2.0
         
-        # 상단/하단 불필요 영역 제외 (상위 7.5%, 하위 7%)
         header_limit = rect.height * 0.075
         footer_limit = rect.height * 0.93
 
@@ -63,7 +61,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
             else:
                 right_blocks.append(b)
 
-        # 컬럼별 Y좌표 정렬 후 파싱
         for col, col_blocks in enumerate([left_blocks, right_blocks]):
             col_blocks.sort(key=lambda x: x[1])
             
@@ -76,7 +73,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 if re.match(r'^\d+[\-~]\d+', text):
                     continue
 
-                # 문제 번호 패턴 (예: "1. ", "01. ", "23. ")
                 match = re.match(r'^\s*(\d{1,2})\.\s*', text)
                 
                 is_real_question = False
@@ -84,7 +80,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
 
                 if match:
                     cand_num = int(match.group(1))
-                    # 첫 문제 시작이거나, 정확히 순차적으로 증가하는 번호인 경우만 진짜 문제로 인정
                     if expected_q_num is None:
                         q_num = cand_num
                         expected_q_num = cand_num + 1
@@ -94,7 +89,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
                         expected_q_num = cand_num + 1
                         is_real_question = True
 
-                # 지문/보기 시작 문구 패턴 (※, * <보기>, [1~3] 등)
                 is_passage = (
                     text.startswith('※') or
                     re.match(r'^[※\*]\s*<보기>', text) or
@@ -279,11 +273,11 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 인쇄 전용 강력 CSS (상단 메뉴, 탭, 사이드바 완전 차단) ---
+# --- 4. 인쇄 전용 CSS (상단 관리자 메뉴, 탭, 버튼, iframe 자동 숨김) ---
 st.markdown("""
     <style>
     @media print {
-        /* Streamlit 기본 메뉴 및 UI 완벽 차단 */
+        /* Streamlit 기본 UI 및 인쇄 버튼 영역 완전 제외 */
         [data-testid="stHeader"],
         [data-testid="stSidebar"],
         [data-testid="stToolbar"],
@@ -292,12 +286,12 @@ st.markdown("""
         .stTabs [role="tablist"],
         .no-print,
         button,
+        iframe,
         header,
         footer {
             display: none !important;
         }
 
-        /* 인쇄 시 여백 최적화 */
         body {
             background-color: white !important;
             color: black !important;
@@ -480,7 +474,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 (전용 인쇄 버튼 제공) ---
+        # --- [탭 3] 개인별 오답노트 인쇄 (부모창 인쇄 기능 적용) ---
         with teacher_tab3:
             st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
             
@@ -504,10 +498,10 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 전용 바로 인쇄 버튼 (클릭 시 웹 UI 차단 후 오답노트만 인쇄)
+                # 부모창 전체 인쇄 실행 버튼 (window.parent.print())
                 st.components.v1.html("""
                     <div style="text-align: center;">
-                        <button onclick="window.print()" style="
+                        <button onclick="window.parent.print()" style="
                             background-color: #1e88e5;
                             color: white;
                             padding: 12px 28px;
@@ -533,11 +527,10 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 images = get_wrong_questions_images(hw_id, wrong_list)
                 
-                # 오답 문제 2단 시험지 배치 ('풀이/정답 작성' 문구 완벽 제거)
+                # '문제 n번' 글자 완전히 제거된 2단 시험지 출력
                 if images:
                     cols_print = st.columns(2)
                     for idx, (q_num, img_bytes) in enumerate(images):
                         with cols_print[idx % 2]:
-                            st.markdown(f"**📍 문제 {q_num}번**")
                             st.image(img_bytes, use_container_width=True)
                             st.markdown("---")
