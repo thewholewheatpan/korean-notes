@@ -340,7 +340,7 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     return data
 
 # --- 4. 메인 화면 ---
-TEACHER_PASSWORD = "1234"
+TEACHER_PASSWORD = "0708"
 
 if "admin_logged_in" not in st.session_state:
     st.session_state["admin_logged_in"] = False
