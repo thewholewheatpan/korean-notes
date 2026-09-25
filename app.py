@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 지문/보기(※) 및 여백 최적화) ---
+# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 지문/보기(※), 단원제외 및 구분선 정밀 제거) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -36,8 +36,8 @@ def process_pdf_and_extract_questions(pdf_bytes):
         rect = page.rect
         mid_x = rect.width / 2.0
         
-        # 헤더/푸터 제외 높이 영역 설정 (상위 4%, 하위 9% 영역 제외)
-        header_limit = rect.height * 0.04
+        # 헤더/푸터 제외 높이 영역 설정 (상위 7.5% 단원제목/헤더 영역 제외, 하위 9% 푸터 제외)
+        header_limit = rect.height * 0.075
         footer_limit = rect.height * 0.91
 
         blocks = page.get_text("blocks")
@@ -52,6 +52,9 @@ def process_pdf_and_extract_questions(pdf_bytes):
             if y0 >= footer_limit or y1 <= header_limit:
                 continue
             if re.match(r'^-\s*\d+\s*-$', text):
+                continue
+            # 단원 제목 형태 ("2-3 음운의 변동", "1-2" 등) 제외
+            if re.match(r'^\d+[\-~]\d+', text):
                 continue
                 
             col = 0 if x0 < mid_x else 1
@@ -69,6 +72,10 @@ def process_pdf_and_extract_questions(pdf_bytes):
 
             for b in col_blocks:
                 x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
+
+                # 단원 제목 형태 재확인 ("2-3", "1-2" 등)
+                if re.match(r'^\d+[\-~]\d+', text):
+                    continue
 
                 # 문제 번호 패턴 (예: "1. ", "01. ")
                 match = re.match(r'^(\d{1,2})\.\s*', text)
@@ -125,15 +132,18 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_y = img.height / q['page_height']
         
         mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
+        # 중앙 구분선 제거를 위한 안쪽 여백 (12pt 상당)
+        divider_margin = int(12 * scale_x)
+
         has_right_col = any(item['page'] == page_num and item['col'] == 1 for item in question_data)
         
-        # 좌/우 컬럼 구분
+        # 좌/우 컬럼 구분 및 구분선 안 들어가게 넓이 축소
         if has_right_col:
             if col == 0:
                 crop_left = 0
-                crop_right = mid_pixel_x
+                crop_right = max(0, mid_pixel_x - divider_margin)
             else:
-                crop_left = mid_pixel_x
+                crop_left = min(img.width, mid_pixel_x + divider_margin)
                 crop_right = img.width
         else:
             crop_left = 0
@@ -369,7 +379,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 지문/보기(※)를 정밀 분석하여 여백 없이 깔끔하게 자릅니다.")
+                st.info("💡 **PDF 지원 안내**: 지문/보기(※)를 정밀 분석하여 여백 및 중앙 세로 구분선 없이 깔끔하게 자릅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
