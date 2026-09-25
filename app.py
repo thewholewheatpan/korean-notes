@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 하단 여백 최적화) ---
+# --- 2. PDF 문제 자동 자르기 (1단 & 2단, 주관식 <조건> 및 하단 여백 최적화) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -69,6 +69,8 @@ def process_pdf_and_extract_questions(pdf_bytes):
             
             current_passage_y0 = None
             current_q = None
+            last_q_num = None
+            in_condition = False  # 주관식 <조건> 상자 내부 상태 여부
 
             for b in col_blocks:
                 x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
@@ -77,8 +79,28 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 if re.match(r'^\d+[\-~]\d+', text):
                     continue
 
+                # 주관식 <조건> 감지
+                if '<조건>' in text or '[조건]' in text or text.startswith('※ 조건') or text.startswith('조건'):
+                    in_condition = True
+
                 # 문제 번호 패턴 (예: "1. ", "01. ")
                 match = re.match(r'^(\d{1,2})\.\s*', text)
+
+                # 조건(1., 2., 3.) 인 경우 문제 번호에서 예외 처리
+                if match:
+                    cand_q_num = int(match.group(1))
+                    expected_q_num = (last_q_num + 1) if last_q_num is not None else 1
+
+                    if in_condition:
+                        # 조건 상태에서는 다음 정식 문제 번호가 아닌 경우 모두 무시
+                        if cand_q_num != expected_q_num or any(term in text for term in ['할 것', '쓰시오', '포함', '지킬 것', '조건', '<', '>', '작성']):
+                            match = None
+                        else:
+                            in_condition = False
+                            last_q_num = cand_q_num
+                    else:
+                        if cand_q_num == expected_q_num:
+                            last_q_num = cand_q_num
 
                 # 지문/보기 시작 문구 패턴 (※, * <보기>, [1~3] 등)
                 is_passage = (
@@ -92,7 +114,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 if is_passage and current_passage_y0 is None and match is None:
                     current_passage_y0 = y0
 
-                # 문제 번호를 만난 경우
+                # 정식 문제 번호를 만난 경우
                 if match:
                     q_num = int(match.group(1))
                     
@@ -132,7 +154,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_y = img.height / q['page_height']
         
         mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
-        # 중앙 구분선 제거를 위한 안쪽 여백 (6pt로 미세 조정하여 우측 선지 잘림 방지)
+        # 중앙 구분선 제거를 위한 안쪽 여백
         divider_margin = int(6 * scale_x)
 
         has_right_col = any(item['page'] == page_num and item['col'] == 1 for item in question_data)
@@ -161,10 +183,8 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 
         # 하단 자르기 위치 결정 (다음 문제 전 OR 실제 텍스트 끝 + 넉넉한 여백)
         if next_q_same_col:
-            # 다음 문제 시작 지점 직전까지 (오프셋 완화)
             crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 2)
         else:
-            # 컬럼의 마지막 문제: 실제 내용 끝(max_y1) + 넉넉한 여백(+35pt로 확대), 푸터 영역 제한
             max_content_y = min(q['max_y1'] + 35, q['page_height'] * 0.93)
             crop_bottom = min(img.height, int(max_content_y * scale_y))
 
@@ -279,7 +299,7 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 인쇄용 CSS ---
+# --- 4. 인쇄용 CSS (2단 레이아웃 유지) ---
 st.markdown("""
     <style>
     @media print {
@@ -288,6 +308,9 @@ st.markdown("""
         footer { display: none !important; }
         .stButton { display: none !important; }
         .no-print { display: none !important; }
+        .element-container, .stColumn {
+            break-inside: avoid;
+        }
     }
     </style>
 """, unsafe_allow_html=True)
@@ -380,7 +403,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 지문/보기(※)를 정밀 분석하여 여백 및 하단 선지 잘림 없이 깔끔하게 자릅니다.")
+                st.info("💡 **PDF 지원 안내**: 지문/보기(※) 및 주관식 <조건>을 인식하여 문제별로 정확히 잘라냅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
@@ -397,10 +420,12 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                                 st.markdown("---")
                                 st.markdown("### 🔍 잘라낸 문제 이미지 전체 미리보기")
                                 preview_images = get_wrong_questions_images(hw_id, list(range(1, q_count + 1)))
-                                for q_num, img_bytes in preview_images:
-                                    st.markdown(f"**📍 문제 {q_num}번**")
-                                    st.image(img_bytes, use_container_width=True)
-                                    st.markdown("---")
+                                preview_cols = st.columns(2)
+                                for idx, (q_num, img_bytes) in enumerate(preview_images):
+                                    with preview_cols[idx % 2]:
+                                        st.markdown(f"**📍 문제 {q_num}번**")
+                                        st.image(img_bytes, use_container_width=True)
+                                        st.markdown("---")
                             else:
                                 st.error("PDF에서 문제 번호(1., 2. 등)를 찾지 못했습니다. 스캔본(이미지형) PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
             
@@ -417,7 +442,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_id = save_homework_from_images(hw_title.strip(), uploaded_files)
                         st.success(f"✅ '{hw_title}' 등록 완료! 총 {len(uploaded_files)}문제가 저장되었습니다.")
         
-        # --- [탭 2] 등록된 숙제 목록 및 삭제 ---
+        # --- [탭 2] 등록된 숙제 목록 및 문제 이미지 보기 ---
         with teacher_tab2:
             st.markdown("### 📚 등록된 숙제 목록 및 삭제 관리")
             
@@ -441,10 +466,23 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                             delete_homework(hw_id)
                             st.success(f"'{title}' 숙제가 삭제되었습니다.")
                             st.rerun()
-                            
+
+                    # 각 숙제별 문제 이미지 확인 (2단 레이아웃 표시)
+                    with st.expander(f"🔍 '{title}' 문제 이미지 목록 보기 ({q_count}문항)"):
+                        hw_imgs = get_wrong_questions_images(hw_id, list(range(1, q_count + 1)))
+                        if hw_imgs:
+                            img_cols = st.columns(2)
+                            for idx, (q_num, img_bytes) in enumerate(hw_imgs):
+                                with img_cols[idx % 2]:
+                                    st.markdown(f"**📍 문제 {q_num}번**")
+                                    st.image(img_bytes, use_container_width=True)
+                                    st.markdown("---")
+                        else:
+                            st.write("저장된 문제 이미지가 없습니다.")
+
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 및 제출 내역 관리 ---
+        # --- [탭 3] 개인별 오답노트 인쇄 (2단 배치) 및 제출 내역 관리 ---
         with teacher_tab3:
             st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
             
@@ -467,18 +505,28 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         st.rerun()
                 
                 st.markdown("---")
-                st.markdown(f"## 📄 맞춤 오답노트: {student_name} 학생")
-                st.write(f"**숙제명:** {hw_title} | **제출일:** {submitted_at}")
-                st.write(f"**다시 풀어볼 오답 번호:** {wrong_str}번")
-                st.markdown("---")
+                
+                # 인쇄용 상단 헤더 (학생 이름 및 숙제 이름만 대형 강조)
+                st.markdown(f"""
+                <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
+                    <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
+                    <h3 style="margin: 8px 0 0 0; color: #333; font-size: 18px;">
+                        학생 이름: <span style="color: #1e88e5;"><b>{student_name}</b></span> &nbsp;|&nbsp; 숙제명: <b>{hw_title}</b>
+                    </h3>
+                </div>
+                """, unsafe_allow_html=True)
                 
                 images = get_wrong_questions_images(hw_id, wrong_list)
                 
-                for q_num, img_bytes in images:
-                    st.markdown(f"### 📍 문제 {q_num}번")
-                    st.image(img_bytes, use_container_width=True)
-                    st.write("📝 **[풀이 / 정답 작성 공간]**")
-                    st.write("\n" * 3)
-                    st.markdown("---")
+                # 원본 시험지처럼 오답 문제를 좌/우 2단 배치
+                if images:
+                    cols_print = st.columns(2)
+                    for idx, (q_num, img_bytes) in enumerate(images):
+                        with cols_print[idx % 2]:
+                            st.markdown(f"**📍 문제 {q_num}번**")
+                            st.image(img_bytes, use_container_width=True)
+                            st.write("📝 **[풀이 / 정답 작성]**")
+                            st.write("\n" * 2)
+                            st.markdown("---")
                     
-                st.markdown("<div class='no-print'><b>💡 팁:</b> 웹브라우저에서 <b>Ctrl + P</b> (Mac은 <b>Cmd + P</b>)를 누르면 옆 메뉴바 없이 오답지 시험지만 깔끔하게 PDF로 저장하거나 인쇄할 수 있습니다.</div>", unsafe_allow_html=True)
+                st.markdown("<div class='no-print' style='margin-top: 20px;'><b>💡 인쇄 팁:</b> 웹브라우저에서 <b>Ctrl + P</b> (Mac은 <b>Cmd + P</b>)를 누르면 상단 헤더 및 메뉴바 없이 2단으로 구성된 오답 시험지만 깔끔하게 PDF 저장/인쇄됩니다.</div>", unsafe_allow_html=True)
