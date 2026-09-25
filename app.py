@@ -323,7 +323,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 5. 선생님 인증 암호 및 로그인 상태 관리 ---
-TEACHER_PASSWORD = "1234"
+TEACHER_PASSWORD = "9735"
 
 if "admin_logged_in" not in st.session_state:
     st.session_state["admin_logged_in"] = False
