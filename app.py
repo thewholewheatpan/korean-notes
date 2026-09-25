@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (타이트한 좌우 여백 적용) ---
+# --- 2. PDF 문제 자동 자르기 (가로 너비 침범 방지 수정 완료) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -61,12 +61,12 @@ def process_pdf_and_extract_questions(pdf_bytes):
             else:
                 right_blocks.append(b)
 
-        # 각 단의 실제 텍스트 영역을 측정하여 타이트한 좌우 경계 설정
-        left_x0 = min([b[0] for b in left_blocks]) - 4 if left_blocks else 0
-        left_x1 = max([b[2] for b in left_blocks]) + 4 if left_blocks else mid_x - 5
+        # 각 단의 실제 텍스트 영역을 측정하여 타이트한 좌우 경계 설정 (중앙 구분선을 넘어가지 않도록 수정)
+        left_x0 = max(0, min([b[0] for b in left_blocks]) - 4) if left_blocks else 0
+        left_x1 = min(mid_x - 4, max([b[2] for b in left_blocks if b[2] <= mid_x + 30] or [mid_x - 5]) + 4) if left_blocks else mid_x - 5
         
-        right_x0 = min([b[0] for b in right_blocks]) - 4 if right_blocks else mid_x + 5
-        right_x1 = max([b[2] for b in right_blocks]) + 4 if right_blocks else rect.width
+        right_x0 = max(mid_x + 4, min([b[0] for b in right_blocks if b[0] >= mid_x - 30] or [mid_x + 5]) - 4) if right_blocks else mid_x + 5
+        right_x1 = min(rect.width, max([b[2] for b in right_blocks]) + 4) if right_blocks else rect.width
 
         for col, col_blocks in enumerate([left_blocks, right_blocks]):
             col_blocks.sort(key=lambda x: x[1])
