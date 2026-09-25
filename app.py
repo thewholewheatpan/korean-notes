@@ -26,7 +26,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (가로 너비 침범 방지 수정 완료) ---
+# --- 2. PDF 문제 자동 자르기 (5번 선지 아래 여백 축소 수정) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -61,7 +61,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
             else:
                 right_blocks.append(b)
 
-        # 각 단의 실제 텍스트 영역을 측정하여 타이트한 좌우 경계 설정 (중앙 구분선을 넘어가지 않도록 수정)
+        # 좌/우 단 가로 경계 설정
         left_x0 = max(0, min([b[0] for b in left_blocks]) - 4) if left_blocks else 0
         left_x1 = min(mid_x - 4, max([b[2] for b in left_blocks if b[2] <= mid_x + 30] or [mid_x - 5]) + 4) if left_blocks else mid_x - 5
         
@@ -79,6 +79,9 @@ def process_pdf_and_extract_questions(pdf_bytes):
 
                 if re.match(r'^\d+[\-~]\d+', text):
                     continue
+
+                # 5번 선지 존재 여부 확인 패턴
+                is_opt_5 = bool(re.search(r'[⑤❺]|[\(\[]5[\)\]]|\b5[\.\)]', text))
 
                 match = re.match(r'^\s*(\d{1,2})\.\s*', text)
                 
@@ -121,6 +124,7 @@ def process_pdf_and_extract_questions(pdf_bytes):
                         'x1': col_x1,
                         'y0': start_y0,
                         'max_y1': y1,
+                        'has_opt_5': is_opt_5,
                         'page_width': rect.width,
                         'page_height': rect.height
                     }
@@ -128,6 +132,8 @@ def process_pdf_and_extract_questions(pdf_bytes):
 
                 elif current_q is not None:
                     current_q['max_y1'] = max(current_q['max_y1'], y1)
+                    if is_opt_5:
+                        current_q['has_opt_5'] = True
 
     question_data.sort(key=lambda x: (x['page'], x['col'], x['y0']))
     extracted_questions = []
@@ -144,10 +150,8 @@ def process_pdf_and_extract_questions(pdf_bytes):
         scale_x = img.width / q['page_width']
         scale_y = img.height / q['page_height']
         
-        # 좌우 여백을 텍스트 영역에 맞추어 균일하고 타이트하게 컷팅
         crop_left = max(0, int(q['x0'] * scale_x))
         crop_right = min(img.width, int(q['x1'] * scale_x))
-
         crop_top = max(0, int(q['y0'] * scale_y) - 10)
         
         next_q_same_col = None
@@ -156,11 +160,18 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 next_q_same_col = question_data[j]
                 break
                 
-        if next_q_same_col:
-            crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 2)
-        else:
-            max_content_y = min(q['max_y1'] + 35, q['page_height'] * 0.93)
+        # 5번 선지가 있는 객관식 문제는 아래 여백을 10pt로 최소화
+        if q.get('has_opt_5', False):
+            max_content_y = q['max_y1'] + 10
+            if next_q_same_col:
+                max_content_y = min(next_q_same_col['y0'] - 2, max_content_y)
             crop_bottom = min(img.height, int(max_content_y * scale_y))
+        else:
+            if next_q_same_col:
+                crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 2)
+            else:
+                max_content_y = min(q['max_y1'] + 35, q['page_height'] * 0.93)
+                crop_bottom = min(img.height, int(max_content_y * scale_y))
 
         if crop_bottom > crop_top + 30 and crop_right > crop_left + 30:
             cropped_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
@@ -273,11 +284,10 @@ def get_wrong_questions_images(hw_id, wrong_nums_list):
     conn.close()
     return data
 
-# --- 4. 인쇄 전용 CSS (Streamlit 상단 바 및 헤더 완전 숨김) ---
+# --- 4. 인쇄 전용 CSS ---
 st.markdown("""
     <style>
     @media print {
-        /* Streamlit 최상단 헤더, 툴바, 사이드바 등 인쇄 시 완벽 숨김 */
         [data-testid="stHeader"],
         [data-testid="stSidebar"],
         [data-testid="stToolbar"],
@@ -504,7 +514,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                 
                 st.markdown("---")
                 
-                # 부모창 전체 인쇄 버튼
                 st.components.v1.html("""
                     <div style="text-align: center;">
                         <button onclick="window.parent.print()" style="
@@ -521,7 +530,6 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     </div>
                 """, height=55)
 
-                # 인쇄용 헤더
                 st.markdown(f"""
                 <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
                     <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
