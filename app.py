@@ -2,7 +2,7 @@ import streamlit as st
 import sqlite3
 import datetime
 import re
-import fitz  # PyMuPDF (PDF 분석용)
+import fitz  # PyMuPDF
 from PIL import Image
 import io
 
@@ -26,60 +26,104 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 처리 함수 ---
+# --- 2. PDF 문제 자동 자르기 (1단 & 2단 지원) ---
 def process_pdf_and_extract_questions(pdf_bytes):
     """
-    PDF 파일 바이너리를 받아 문제 번호(1., 2. 등) 위치를 감지해 이미지 목록으로 반환
-    반환값: [(문제번호, 이미지바이트), ...]
+    PDF 바이너리를 받아 1단/2단 레이아웃을 자동 구분한 뒤
+    문제 번호(1., 2. 등) 단위로 이미지를 잘라 반환합니다.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
 
-    # 1) 전체 페이지에서 문제 번호 좌표 추출
+    # 1) 전체 페이지에서 문제 번호 위치 및 단(Column) 수집
     for page_num in range(len(doc)):
         page = doc[page_num]
+        rect = page.rect
+        mid_x = rect.width / 2.0  # 페이지 가로 중앙선
+        
         blocks = page.get_text("blocks")
         for b in blocks:
             text = b[4].strip()
-            # "1.", "01." 등 번호 패턴 인식
             match = re.match(r'^(\d{1,2})\.\s*', text)
             if match:
                 q_num = int(match.group(1))
+                x0, y0, x1, y1 = b[0], b[1], b[2], b[3]
+                
+                # 문제 번호 위치에 따라 왼쪽 단(0) / 오른쪽 단(1) 구분
+                col = 0 if x0 < mid_x else 1
+                
                 question_data.append({
                     'q_num': q_num,
                     'page': page_num,
-                    'y0': b[1],
-                    'y1': b[3]
+                    'col': col,
+                    'x0': x0,
+                    'y0': y0,
+                    'y1': y1,
+                    'page_width': rect.width,
+                    'page_height': rect.height
                 })
 
-    question_data.sort(key=lambda x: (x['page'], x['q_num']))
+    # 페이지 내에서 [단 순서(좌->우) -> Y축 순서(위->아래)]로 정렬
+    question_data.sort(key=lambda x: (x['page'], x['col'], x['y0']))
+
     extracted_questions = []
 
-    # 2) 문제별 영역 크롭 및 PNG 변환
+    # 2) 문제별 크롭 처리 (2단 레이아웃 분할)
     for i, q in enumerate(question_data):
         q_num = q['q_num']
         page_num = q['page']
+        col = q['col']
         page = doc[page_num]
         
+        # 고해상도(300 DPI) 이미지 변환
         pix = page.get_pixmap(dpi=300)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        rect = page.rect
-        scale_y = img.height / rect.height
         
-        crop_top = max(0, int(q['y0'] * scale_y))
+        scale_x = img.width / q['page_width']
+        scale_y = img.height / q['page_height']
         
-        # 다음 문제가 동일 페이지에 있을 경우 경계 설정
-        if i < len(question_data) - 1 and question_data[i+1]['page'] == page_num:
-            crop_bottom = min(img.height, int(question_data[i+1]['y0'] * scale_y))
+        mid_pixel_x = int((q['page_width'] / 2.0) * scale_x)
+        
+        # 해당 페이지에 오른쪽 단(col=1) 문제가 존재하는지 확인 (2단 여부 판별)
+        has_right_col = any(item['page'] == page_num and item['col'] == 1 for item in question_data)
+        
+        # 가로(X축) 잘라내기 범위 설정
+        if has_right_col:
+            if col == 0:
+                crop_left = 0
+                crop_right = mid_pixel_x
+            else:
+                crop_left = mid_pixel_x
+                crop_right = img.width
         else:
-            crop_bottom = img.height
+            # 1단 문서인 경우 전체 너비 사용
+            crop_left = 0
+            crop_right = img.width
 
-        if crop_bottom > crop_top + 20:
-            cropped_img = img.crop((0, crop_top, img.width, crop_bottom))
+        # 세로(Y축) 시작 위치
+        crop_top = max(0, int(q['y0'] * scale_y) - 10) # 문제 번호 약간 위부터 캡처
+        
+        # 세로(Y축) 끝 위치: 동일 페이지, 동일 단(Column) 내의 다음 문제 시작 위치까지
+        next_q_same_col = None
+        for j in range(i + 1, len(question_data)):
+            if question_data[j]['page'] == page_num and question_data[j]['col'] == col:
+                next_q_same_col = question_data[j]
+                break
+                
+        if next_q_same_col:
+            crop_bottom = min(img.height, int(next_q_same_col['y0'] * scale_y) - 5)
+        else:
+            crop_bottom = img.height  # 단의 맨 마지막 문제인 경우 페이지 하단까지
+
+        # 문제 크롭 및 PNG 저장
+        if crop_bottom > crop_top + 30 and crop_right > crop_left + 30:
+            cropped_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
             img_byte_arr = io.BytesIO()
             cropped_img.save(img_byte_arr, format='PNG')
             extracted_questions.append((q_num, img_byte_arr.getvalue()))
 
+    # 최종 문제는 문제 번호 순서대로 다시 정렬하여 리턴
+    extracted_questions.sort(key=lambda x: x[0])
     return extracted_questions
 
 # --- 3. DB 작업용 함수들 ---
@@ -181,17 +225,16 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 5. 선생님 인증 암호 설정 (기본값: 1234) ---
-TEACHER_PASSWORD = "9735"
+# --- 5. 선생님 인증 암호 설정 ---
+TEACHER_PASSWORD = "1234"
 
 st.title("📚 국어 오답노트 생성 시스템")
 
-# 메뉴 구성
 menu_options = ["📝 [학생] 오답 체크하기", "🔒 [선생님] 관리자 모드"]
 selected_menu = st.sidebar.selectbox("원하는 작업을 선택하세요", menu_options)
 
 # -------------------------------------------------------------
-# 메뉴 1: [학생] 오답 체크하기 (기본 노출)
+# 메뉴 1: [학생] 오답 체크하기
 # -------------------------------------------------------------
 if selected_menu == "📝 [학생] 오답 체크하기":
     st.subheader("📝 학생 오답 제출")
@@ -230,7 +273,7 @@ if selected_menu == "📝 [학생] 오답 체크하기":
                 st.success(f"🎉 {student_name} 학생, 제출이 완료되었습니다! 오답 문제: {wrong_answers}")
 
 # -------------------------------------------------------------
-# 메뉴 2: [선생님] 관리자 모드 (비밀번호 인증 필요)
+# 메뉴 2: [선생님] 관리자 모드
 # -------------------------------------------------------------
 elif selected_menu == "🔒 [선생님] 관리자 모드":
     st.subheader("🔒 선생님 전용 관리자 인증")
@@ -244,7 +287,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
         
         teacher_tab1, teacher_tab2 = st.tabs(["📤 새 숙제 등록", "🖨️ 학생별 오답노트 인쇄"])
         
-        # --- [탭 1] 새 숙제 등록 (PDF 자동 자르기 및 이미지 직접 업로드 지원) ---
+        # --- [탭 1] 새 숙제 등록 ---
         with teacher_tab1:
             st.markdown("### 📤 새 숙제 문제 등록")
             hw_title = st.text_input("숙제 이름 (예: 3월 2주차 문법 - 음운의 변동)")
@@ -252,7 +295,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             upload_mode = st.radio("업로드 방식을 선택하세요", ["📄 PDF 자동 문제 분할 업로드", "🖼️ 이미지 파일 직접 업로드 (1.png, 2.png 등)"])
             
             if upload_mode == "📄 PDF 자동 문제 분할 업로드":
-                st.info("💡 **PDF 지원 안내**: 텍스트 선택이 가능한 PDF 문서를 올리면 '1.', '2.' 등 문제 번호 위치를 인식해 이미지로 자동 자릅니다.")
+                st.info("💡 **PDF 지원 안내**: 텍스트 선택이 가능한 PDF를 올리면 1단/2단 구분 후 문제 단위로 정밀하게 자릅니다.")
                 pdf_file = st.file_uploader("PDF 파일을 선택하세요", type=['pdf'])
                 
                 if st.button("PDF로 숙제 등록 완료"):
@@ -261,12 +304,21 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     elif not pdf_file:
                         st.error("PDF 파일을 업로드해 주세요.")
                     else:
-                        with st.spinner("PDF에서 문제 번호를 읽고 이미지로 자동 분할 중입니다..."):
+                        with st.spinner("PDF 레이아웃 분석 및 문제 이미지 자동 분할 중..."):
                             hw_id, q_count = save_homework_from_pdf(hw_title.strip(), pdf_file)
                             if q_count > 0:
                                 st.success(f"✅ '{hw_title}' 등록 완료! 총 {q_count}문제가 자동 자르기로 저장되었습니다.")
+                                
+                                # 👇 잘려진 문제 이미지 바로 아래에 미리보기 출력
+                                st.markdown("---")
+                                st.markdown("### 🔍 잘라낸 문제 이미지 전체 미리보기")
+                                preview_images = get_wrong_questions_images(hw_id, list(range(1, q_count + 1)))
+                                for q_num, img_bytes in preview_images:
+                                    st.markdown(f"**📍 문제 {q_num}번**")
+                                    st.image(img_bytes, use_container_width=True)
+                                    st.markdown("---")
                             else:
-                                st.error("PDF에서 문제 번호(1., 2. 등)를 찾지 못했습니다. 스캔본/이미지형 PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
+                                st.error("PDF에서 문제 번호(1., 2. 등)를 찾지 못했습니다. 스캔본(이미지형) PDF인 경우 이미지 직접 업로드 방식을 사용해 주세요.")
             
             else:
                 st.info("💡 **팁**: 캡처한 이미지 파일명을 1.png, 2.png 순으로 붙여 업로드하세요.")
