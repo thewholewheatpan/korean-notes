@@ -198,8 +198,27 @@ def get_students():
     c.execute("SELECT name FROM students")
     data = c.fetchall()
     conn.close()
-    # ㄱㄴㄷ순 정렬
     return sorted([d[0] for d in data])
+
+# 학생별 총 누적 오답 개수 계산 함수
+def get_students_with_wrong_counts():
+    conn = sqlite3.connect('wrong_answer_db.db')
+    c = conn.cursor()
+    c.execute("SELECT name FROM students")
+    students = [d[0] for d in c.fetchall()]
+    
+    c.execute("SELECT student_name, wrong_nums FROM submissions")
+    submissions = c.fetchall()
+    conn.close()
+    
+    counts = {name: 0 for name in students}
+    for s_name, wrong_str in submissions:
+        if s_name in counts:
+            if wrong_str:
+                counts[s_name] += len([n for n in wrong_str.split(',') if n.strip()])
+                
+    sorted_students = sorted(students)
+    return [(s, counts[s]) for s in sorted_students]
 
 def delete_student(name):
     conn = sqlite3.connect('wrong_answer_db.db')
@@ -285,7 +304,6 @@ def get_submitted_students():
     c.execute("SELECT DISTINCT student_name FROM submissions")
     data = c.fetchall()
     conn.close()
-    # ㄱㄴㄷ순 정렬
     return sorted([d[0] for d in data])
 
 def get_submissions_by_student(student_name):
@@ -368,7 +386,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 5. 선생님 인증 암호 및 상태 관리 ---
-TEACHER_PASSWORD = "1234"
+TEACHER_PASSWORD = "0708"
 
 if "admin_logged_in" not in st.session_state:
     st.session_state["admin_logged_in"] = False
@@ -392,10 +410,8 @@ if selected_menu == "📝 [학생] 오답 체크하기":
     elif not homeworks:
         st.info("등록된 숙제가 없습니다. 선생님께 문의하세요.")
     else:
-        # 1. 사전 등록된 학생 드롭다운 선택 (ㄱㄴㄷ순 정렬 반영)
         student_name = st.selectbox("👨‍🎓 이름을 선택하세요", students, key="student_name_select")
         
-        # 2. 숙제 선택
         hw_options = {f"{hw[1]}": hw[0] for hw in homeworks}
         selected_hw_title = st.selectbox("📖 숙제를 선택하세요", list(hw_options.keys()))
         selected_hw_id = hw_options[selected_hw_title]
@@ -417,7 +433,6 @@ if selected_menu == "📝 [학생] 오답 체크하기":
                             wrong_answers.append(q_num)
                     
         st.markdown("---")
-        # 오답 선택 개수 실시간 현황 표기
         st.markdown(f"📊 선택한 오답 문항 수: <b style='color:#e53935; font-size:18px;'>총 {len(wrong_answers)}개</b>", unsafe_allow_html=True)
         st.write("")
         
@@ -564,7 +579,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 학생 명단 사전 등록 관리 (우측 상단 총 인원수 표시) ---
+        # --- [탭 3] 학생 명단 사전 등록 관리 (총 누적 오답 개수 표시 반영) ---
         with teacher_tab3:
             st.markdown("### 👤 학생 명단 관리")
             st.write("학생들이 오답을 제출할 때 선택할 이름 목록을 미리 등록합니다.")
@@ -587,29 +602,28 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             
             st.markdown("---")
             
-            current_students = get_students()
+            students_with_counts = get_students_with_wrong_counts()
             
-            # 목록 헤더 및 우측 상단 등록 총 인원 표기
             list_hdr_col1, list_hdr_col2 = st.columns([2, 1])
             with list_hdr_col1:
                 st.markdown("##### 📋 현재 등록된 학생 목록 (ㄱㄴㄷ순)")
             with list_hdr_col2:
-                st.markdown(f"<div style='text-align: right; color: #1e88e5; font-size: 15px;'><b>총 {len(current_students)}명</b> 등록됨</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align: right; color: #1e88e5; font-size: 15px;'><b>총 {len(students_with_counts)}명</b> 등록됨</div>", unsafe_allow_html=True)
 
-            if not current_students:
+            if not students_with_counts:
                 st.info("등록된 학생이 없습니다. 위에서 학생 이름을 추가해 주세요.")
             else:
-                for s_name in current_students:
+                for s_name, wrong_count in students_with_counts:
                     s_col1, s_col2 = st.columns([3, 1])
                     with s_col1:
-                        st.markdown(f"• **{s_name}**")
+                        st.markdown(f"• **{s_name}** &nbsp; <span style='color: #e53935; font-size: 14px;'>(누적 오답: <b>{wrong_count}개</b>)</span>", unsafe_allow_html=True)
                     with s_col2:
                         if st.button("🗑️ 삭제", key=f"del_student_{s_name}"):
                             delete_student(s_name)
                             st.success(f"'{s_name}' 학생이 삭제되었습니다.")
                             st.rerun()
 
-        # --- [탭 4] 학생별 오답노트 인쇄 및 관리 (오답 개수 표기) ---
+        # --- [탭 4] 학생별 오답노트 인쇄 및 관리 ---
         with teacher_tab4:
             st.markdown("### 🖨️ 학생별 오답노트 출력 및 삭제 관리")
             
@@ -617,10 +631,8 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             if not submitted_students:
                 st.info("아직 학생들이 제출한 오답 내역이 없습니다.")
             else:
-                # 1. 학생 선택 (ㄱㄴㄷ순)
                 selected_student = st.selectbox("👨‍🎓 관리할 학생을 선택하세요", submitted_students)
                 
-                # 2. 해당 학생 제출 내역
                 student_submissions = get_submissions_by_student(selected_student)
                 
                 if not student_submissions:
