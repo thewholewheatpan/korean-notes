@@ -16,6 +16,8 @@ def init_db():
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, homework_id INTEGER, q_num INTEGER, image_data BLOB)''')
     c.execute('''CREATE TABLE IF NOT EXISTS submissions 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, student_name TEXT, homework_id INTEGER, wrong_nums TEXT, submitted_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS students 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)''')
     conn.commit()
     conn.close()
 
@@ -26,7 +28,7 @@ def natural_sort_key(file):
     numbers = re.findall(r'\d+', file.name)
     return int(numbers[0]) if numbers else file.name
 
-# --- 2. PDF 문제 자동 자르기 (하단 여백 대폭 축소 수정) ---
+# --- 2. PDF 문제 자동 자르기 ---
 def process_pdf_and_extract_questions(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     question_data = []
@@ -61,7 +63,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
             else:
                 right_blocks.append(b)
 
-        # 좌/우 단 가로 경계 설정
         left_x0 = max(0, min([b[0] for b in left_blocks]) - 4) if left_blocks else 0
         left_x1 = min(mid_x - 4, max([b[2] for b in left_blocks if b[2] <= mid_x + 30] or [mid_x - 5]) + 4) if left_blocks else mid_x - 5
         
@@ -80,7 +81,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 if re.match(r'^\d+[\-~]\d+', text):
                     continue
 
-                # 5번 선지 존재 여부 확인 패턴
                 is_opt_5 = bool(re.search(r'[⑤❺]|[\(\[]5[\)\]]|\b5[\.\)]', text))
 
                 match = re.match(r'^\s*(\d{1,2})\.\s*', text)
@@ -160,7 +160,6 @@ def process_pdf_and_extract_questions(pdf_bytes):
                 next_q_same_col = question_data[j]
                 break
                 
-        # 하단 여백 대폭 축소 (기존 기준의 절반 이하인 +4pt / +10pt만 유지)
         extra_margin = 4 if q.get('has_opt_5', False) else 10
         max_content_y = q['max_y1'] + extra_margin
 
@@ -181,6 +180,33 @@ def process_pdf_and_extract_questions(pdf_bytes):
     return extracted_questions
 
 # --- 3. DB 작업용 함수들 ---
+def add_student(name):
+    conn = sqlite3.connect('wrong_answer_db.db')
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO students (name) VALUES (?)", (name,))
+        conn.commit()
+        res = True
+    except sqlite3.IntegrityError:
+        res = False
+    conn.close()
+    return res
+
+def get_students():
+    conn = sqlite3.connect('wrong_answer_db.db')
+    c = conn.cursor()
+    c.execute("SELECT name FROM students ORDER BY name")
+    data = c.fetchall()
+    conn.close()
+    return [d[0] for d in data]
+
+def delete_student(name):
+    conn = sqlite3.connect('wrong_answer_db.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM students WHERE name = ?", (name,))
+    conn.commit()
+    conn.close()
+
 def save_homework_from_pdf(title, pdf_file):
     questions = process_pdf_and_extract_questions(pdf_file.read())
     if not questions:
@@ -234,6 +260,14 @@ def delete_homework(hw_id):
     conn.commit()
     conn.close()
 
+def update_question_image(hw_id, q_num, image_bytes):
+    conn = sqlite3.connect('wrong_answer_db.db')
+    c = conn.cursor()
+    c.execute("UPDATE questions SET image_data = ? WHERE homework_id = ? AND q_num = ?", 
+              (image_bytes, hw_id, q_num))
+    conn.commit()
+    conn.close()
+
 def save_submission(student_name, hw_id, wrong_nums_list):
     conn = sqlite3.connect('wrong_answer_db.db')
     c = conn.cursor()
@@ -244,13 +278,22 @@ def save_submission(student_name, hw_id, wrong_nums_list):
     conn.commit()
     conn.close()
 
-def get_submissions():
+def get_submitted_students():
+    conn = sqlite3.connect('wrong_answer_db.db')
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT student_name FROM submissions ORDER BY student_name")
+    data = c.fetchall()
+    conn.close()
+    return [d[0] for d in data]
+
+def get_submissions_by_student(student_name):
     conn = sqlite3.connect('wrong_answer_db.db')
     c = conn.cursor()
     c.execute('''SELECT s.id, s.student_name, h.title, s.wrong_nums, s.submitted_at, s.homework_id 
                  FROM submissions s 
                  JOIN homeworks h ON s.homework_id = h.id 
-                 ORDER BY s.id DESC''')
+                 WHERE s.student_name = ?
+                 ORDER BY s.id DESC''', (student_name,))
     data = c.fetchall()
     conn.close()
     return data
@@ -322,8 +365,8 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 5. 선생님 인증 암호 및 로그인 상태 관리 ---
-TEACHER_PASSWORD = "9735"
+# --- 5. 선생님 인증 암호 및 상태 관리 ---
+TEACHER_PASSWORD = "0708"
 
 if "admin_logged_in" not in st.session_state:
     st.session_state["admin_logged_in"] = False
@@ -334,20 +377,26 @@ menu_options = ["📝 [학생] 오답 체크하기", "🔒 [선생님] 관리자
 selected_menu = st.sidebar.selectbox("원하는 작업을 선택하세요", menu_options)
 
 # -------------------------------------------------------------
-# 메뉴 1: [학생] 오답 체크하기
+# 메뉴 1: [학생] 오답 체크하기 (드롭다운 이름 선택 방식)
 # -------------------------------------------------------------
 if selected_menu == "📝 [학생] 오답 체크하기":
     st.subheader("📝 학생 오답 제출")
     
+    students = get_students()
     homeworks = get_homeworks()
-    if not homeworks:
+    
+    if not students:
+        st.warning("⚠️ 등록된 학생이 없습니다. 선생님께 학생 등록을 요청해 주세요.")
+    elif not homeworks:
         st.info("등록된 숙제가 없습니다. 선생님께 문의하세요.")
     else:
-        hw_options = {f"{hw[1]}": hw[0] for hw in homeworks}
-        selected_hw_title = st.selectbox("숙제를 선택하세요", list(hw_options.keys()))
-        selected_hw_id = hw_options[selected_hw_title]
+        # 1. 사전 등록된 학생 드롭다운 선택
+        student_name = st.selectbox("👨‍🎓 이름을 선택하세요", students, key="student_name_select")
         
-        student_name = st.text_input("이름을 입력하세요 (예: 홍길동)")
+        # 2. 숙제 선택
+        hw_options = {f"{hw[1]}": hw[0] for hw in homeworks}
+        selected_hw_title = st.selectbox("📖 숙제를 선택하세요", list(hw_options.keys()))
+        selected_hw_id = hw_options[selected_hw_title]
         
         total_q = get_question_count(selected_hw_id)
         st.write(f"총 문항 수: **{total_q}문제**")
@@ -355,21 +404,22 @@ if selected_menu == "📝 [학생] 오답 체크하기":
         st.markdown("---")
         st.write("👇 **틀린 문제 번호를 모두 체크해 주세요.**")
         
-        cols = st.columns(5)
         wrong_answers = []
-        for i in range(1, total_q + 1):
-            with cols[(i - 1) % 5]:
-                if st.checkbox(f"{i}번", key=f"q_{i}"):
-                    wrong_answers.append(i)
+        for row_start in range(1, total_q + 1, 5):
+            cols = st.columns(5)
+            for j in range(5):
+                q_num = row_start + j
+                if q_num <= total_q:
+                    with cols[j]:
+                        if st.checkbox(f"{q_num}번", key=f"q_{q_num}"):
+                            wrong_answers.append(q_num)
                     
         st.markdown("---")
         if st.button("제출하기"):
-            if not student_name.strip():
-                st.error("이름을 입력해 주세요.")
-            elif not wrong_answers:
+            if not wrong_answers:
                 st.warning("틀린 문제 번호를 하나 이상 선택해 주세요.")
             else:
-                save_submission(student_name.strip(), selected_hw_id, wrong_answers)
+                save_submission(student_name, selected_hw_id, wrong_answers)
                 st.success(f"🎉 {student_name} 학생, 제출이 완료되었습니다! 오답 문제: {wrong_answers}")
 
 # -------------------------------------------------------------
@@ -396,9 +446,10 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
             st.session_state["admin_logged_in"] = False
             st.rerun()
 
-        teacher_tab1, teacher_tab2, teacher_tab3 = st.tabs([
+        teacher_tab1, teacher_tab2, teacher_tab3, teacher_tab4 = st.tabs([
             "📤 새 숙제 등록", 
-            "📚 등록된 숙제 목록 및 삭제", 
+            "📚 등록된 숙제 목록 및 개별 수정", 
+            "👤 학생 명단 관리",
             "🖨️ 학생별 오답노트 인쇄 및 관리"
         ])
         
@@ -448,9 +499,9 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_id = save_homework_from_images(hw_title.strip(), uploaded_files)
                         st.success(f"✅ '{hw_title}' 등록 완료! 총 {len(uploaded_files)}문제가 저장되었습니다.")
         
-        # --- [탭 2] 등록된 숙제 목록 및 문제 이미지 보기 ---
+        # --- [탭 2] 등록된 숙제 목록 및 개별 문제 이미지 교체 ---
         with teacher_tab2:
-            st.markdown("### 📚 등록된 숙제 목록 및 삭제 관리")
+            st.markdown("### 📚 등록된 숙제 목록 및 개별 문제 수정")
             
             homeworks = get_homeworks()
             if not homeworks:
@@ -473,7 +524,28 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                             st.success(f"'{title}' 숙제가 삭제되었습니다.")
                             st.rerun()
 
-                    with st.expander(f"🔍 '{title}' 문제 이미지 목록 보기 ({q_count}문항)"):
+                    with st.expander(f"🛠️ '{title}' 문제 보기 / 잘못 잘린 특정 문제 교체하기"):
+                        st.markdown("##### ✏️ 잘못 잘린 문제 교체하기")
+                        rep_col1, rep_col2, rep_col3 = st.columns([1, 2, 1])
+                        
+                        with rep_col1:
+                            target_q_num = st.number_input("수정할 문제 번호", min_value=1, max_value=q_count, value=1, key=f"num_{hw_id}")
+                        with rep_col2:
+                            new_q_img = st.file_uploader("새 문제 이미지 첨부", type=['png', 'jpg', 'jpeg'], key=f"file_{hw_id}")
+                        with rep_col3:
+                            st.write("")
+                            st.write("")
+                            if st.button("이 문제 이미지 교체", key=f"btn_rep_{hw_id}"):
+                                if new_q_img:
+                                    update_question_image(hw_id, target_q_num, new_q_img.read())
+                                    st.success(f"✅ {target_q_num}번 문제 이미지가 새로운 이미지로 교체되었습니다!")
+                                    st.rerun()
+                                else:
+                                    st.warning("교체할 이미지 파일을 등록해 주세요.")
+
+                        st.markdown("---")
+                        
+                        st.markdown("##### 🔍 전체 문제 이미지 미리보기")
                         hw_imgs = get_wrong_questions_images(hw_id, list(range(1, q_count + 1)))
                         if hw_imgs:
                             img_cols = st.columns(2)
@@ -486,59 +558,105 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 개인별 오답노트 인쇄 ---
+        # --- [탭 3] 학생 명단 사전 등록 관리 ---
         with teacher_tab3:
-            st.markdown("### 🖨️ 제출된 학생 오답노트 출력 및 삭제 관리")
+            st.markdown("### 👤 학생 명단 관리")
+            st.write("학생들이 오답을 제출할 때 선택할 이름 목록을 미리 등록합니다.")
             
-            submissions = get_submissions()
-            if not submissions:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                new_student_name = st.text_input("새 학생 이름 입력", key="new_student_input")
+            with col2:
+                st.write("")
+                st.write("")
+                if st.button("➕ 학생 등록"):
+                    if new_student_name.strip():
+                        if add_student(new_student_name.strip()):
+                            st.success(f"✅ '{new_student_name.strip()}' 학생이 등록되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error("이미 등록되어 있는 학생 이름입니다.")
+                    else:
+                        st.warning("학생 이름을 입력해 주세요.")
+            
+            st.markdown("---")
+            st.markdown("##### 📋 현재 등록된 학생 목록")
+            current_students = get_students()
+            if not current_students:
+                st.info("등록된 학생이 없습니다. 위에서 학생 이름을 추가해 주세요.")
+            else:
+                for s_name in current_students:
+                    s_col1, s_col2 = st.columns([3, 1])
+                    with s_col1:
+                        st.markdown(f"• **{s_name}**")
+                    with s_col2:
+                        if st.button("🗑️ 삭제", key=f"del_student_{s_name}"):
+                            delete_student(s_name)
+                            st.success(f"'{s_name}' 학생이 삭제되었습니다.")
+                            st.rerun()
+
+        # --- [탭 4] 학생별 오답노트 인쇄 및 관리 ---
+        with teacher_tab4:
+            st.markdown("### 🖨️ 학생별 오답노트 출력 및 삭제 관리")
+            
+            submitted_students = get_submitted_students()
+            if not submitted_students:
                 st.info("아직 학생들이 제출한 오답 내역이 없습니다.")
             else:
-                sub_options = {f"{sub[1]} - {sub[2]} ({sub[4]})": sub for sub in submissions}
-                selected_sub_title = st.selectbox("관리할 학생 제출 내역을 선택하세요", list(sub_options.keys()))
-                selected_sub = sub_options[selected_sub_title]
+                # 1. 학생 선택
+                selected_student = st.selectbox("👨‍🎓 관리할 학생을 선택하세요", submitted_students)
                 
-                sub_id, student_name, hw_title, wrong_str, submitted_at, hw_id = selected_sub
-                wrong_list = [int(n) for n in wrong_str.split(',')] if wrong_str else []
+                # 2. 해당 학생이 제출한 숙제 목록 불러오기
+                student_submissions = get_submissions_by_student(selected_student)
                 
-                col1, col2 = st.columns([3, 1])
-                with col2:
-                    if st.button("🗑️ 선택된 제출 내역 삭제"):
-                        delete_submission(sub_id)
-                        st.success(f"'{student_name}' 학생의 제출 내역이 삭제되었습니다.")
-                        st.rerun()
-                
-                st.markdown("---")
-                
-                st.components.v1.html("""
-                    <div style="text-align: center;">
-                        <button onclick="window.parent.print()" style="
-                            background-color: #1e88e5;
-                            color: white;
-                            padding: 12px 28px;
-                            font-size: 16px;
-                            font-weight: bold;
-                            border: none;
-                            border-radius: 8px;
-                            cursor: pointer;
-                            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                        ">🖨️ 이 오답노트 바로 인쇄하기 (또는 PDF 저장)</button>
-                    </div>
-                """, height=55)
+                if not student_submissions:
+                    st.warning("해당 학생의 제출 내역이 없습니다.")
+                else:
+                    sub_options = {f"{sub[2]} (제출일시: {sub[4]})": sub for sub in student_submissions}
+                    selected_sub_title = st.selectbox("📖 제출한 숙제를 선택하세요", list(sub_options.keys()))
+                    selected_sub = sub_options[selected_sub_title]
+                    
+                    sub_id, student_name, hw_title, wrong_str, submitted_at, hw_id = selected_sub
+                    wrong_list = [int(n) for n in wrong_str.split(',')] if wrong_str else []
+                    
+                    col1, col2 = st.columns([3, 1])
+                    with col2:
+                        if st.button("🗑️ 이 숙제 제출 내역 삭제"):
+                            delete_submission(sub_id)
+                            st.success(f"'{student_name}' 학생의 '{hw_title}' 제출 내역이 삭제되었습니다.")
+                            st.rerun()
+                    
+                    st.markdown("---")
+                    
+                    st.components.v1.html("""
+                        <div style="text-align: center;">
+                            <button onclick="window.parent.print()" style="
+                                background-color: #1e88e5;
+                                color: white;
+                                padding: 12px 28px;
+                                font-size: 16px;
+                                font-weight: bold;
+                                border: none;
+                                border-radius: 8px;
+                                cursor: pointer;
+                                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                            ">🖨️ 이 오답노트 바로 인쇄하기 (또는 PDF 저장)</button>
+                        </div>
+                    """, height=55)
 
-                st.markdown(f"""
-                <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
-                    <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
-                    <h3 style="margin: 8px 0 0 0; color: #333; font-size: 18px;">
-                        학생 이름: <span style="color: #1e88e5;"><b>{student_name}</b></span> &nbsp;|&nbsp; 숙제명: <b>{hw_title}</b>
-                    </h3>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                images = get_wrong_questions_images(hw_id, wrong_list)
-                
-                if images:
-                    cols_print = st.columns(2)
-                    for idx, (q_num, img_bytes) in enumerate(images):
-                        with cols_print[idx % 2]:
-                            st.image(img_bytes, use_container_width=True)
+                    st.markdown(f"""
+                    <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
+                        <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
+                        <h3 style="margin: 8px 0 0 0; color: #333; font-size: 18px;">
+                            학생 이름: <span style="color: #1e88e5;"><b>{student_name}</b></span> &nbsp;|&nbsp; 숙제명: <b>{hw_title}</b>
+                        </h3>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    images = get_wrong_questions_images(hw_id, wrong_list)
+                    
+                    if images:
+                        cols_print = st.columns(2)
+                        for idx, (q_num, img_bytes) in enumerate(images):
+                            with cols_print[idx % 2]:
+                                st.image(img_bytes, use_container_width=True)
