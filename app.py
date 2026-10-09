@@ -1,27 +1,21 @@
 import streamlit as st
-import sqlite3
 import datetime
 import re
 import fitz  # PyMuPDF
 from PIL import Image
 import io
+import base64
+from supabase import create_client, Client
 
-# --- 1. 데이터베이스(DB) 초기화 ---
-def init_db():
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS homeworks 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS questions 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, homework_id INTEGER, q_num INTEGER, image_data BLOB)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS submissions 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, student_name TEXT, homework_id INTEGER, wrong_nums TEXT, submitted_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS students 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)''')
-    conn.commit()
-    conn.close()
+# --- 1. Supabase 연동 설정 ---
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "https://whojdlldrwcblhoyynsl.supabase.co").replace("/rest/v1/", "").rstrip("/")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indob2pkbGxkcndjYmxob3l5bnNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1NTA1NDEsImV4cCI6MjEwNzEyNjU0MX0.MTQmLUEdQ40Go6ewY4gZgNy1woMEibEuocA4yKx3p-w")
 
-init_db()
+@st.cache_resource
+def init_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+supabase = init_supabase()
 
 # 자연스러운 파일명 정렬 함수
 def natural_sort_key(file):
@@ -179,185 +173,141 @@ def process_pdf_and_extract_questions(pdf_bytes):
     extracted_questions.sort(key=lambda x: x[0])
     return extracted_questions
 
-# --- 3. DB 작업용 함수들 ---
+# --- 3. Supabase DB 작업 함수들 ---
 def add_student(name):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
     try:
-        c.execute("INSERT INTO students (name) VALUES (?)", (name,))
-        conn.commit()
-        res = True
-    except sqlite3.IntegrityError:
-        res = False
-    conn.close()
-    return res
+        supabase.table("students").insert({"name": name}).execute()
+        return True
+    except Exception:
+        return False
 
 def get_students():
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("SELECT name FROM students")
-    data = c.fetchall()
-    conn.close()
-    return sorted([d[0] for d in data])
+    res = supabase.table("students").select("name").order("name").execute()
+    return [d["name"] for d in res.data] if res.data else []
 
 def get_students_with_wrong_counts():
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("SELECT name FROM students")
-    students = [d[0] for d in c.fetchall()]
-    
-    c.execute("SELECT student_name, wrong_nums FROM submissions")
-    submissions = c.fetchall()
-    conn.close()
+    students = get_students()
+    res = supabase.table("submissions").select("student_name, wrong_nums").execute()
+    submissions = res.data if res.data else []
     
     counts = {name: 0 for name in students}
-    for s_name, wrong_str in submissions:
-        if s_name in counts:
-            if wrong_str:
-                counts[s_name] += len([n for n in wrong_str.split(',') if n.strip()])
+    for sub in submissions:
+        s_name = sub.get("student_name")
+        wrong_str = sub.get("wrong_nums", "")
+        if s_name in counts and wrong_str:
+            counts[s_name] += len([n for n in wrong_str.split(",") if n.strip()])
                 
-    sorted_students = sorted(students)
-    return [(s, counts[s]) for s in sorted_students]
+    return [(s, counts[s]) for s in students]
 
 def delete_student(name):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("DELETE FROM students WHERE name = ?", (name,))
-    conn.commit()
-    conn.close()
+    supabase.table("students").delete().eq("name", name).execute()
 
 def save_homework_from_pdf(title, pdf_file):
     questions = process_pdf_and_extract_questions(pdf_file.read())
     if not questions:
         return None, 0
     
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    c.execute("INSERT INTO homeworks (title, created_at) VALUES (?, ?)", (title, now))
-    hw_id = c.lastrowid
+    hw_res = supabase.table("homeworks").insert({"title": title, "created_at": now}).execute()
+    if not hw_res.data:
+        return None, 0
     
+    hw_id = hw_res.data[0]["id"]
+    
+    q_records = []
     for q_num, img_bytes in questions:
-        c.execute("INSERT INTO questions (homework_id, q_num, image_data) VALUES (?, ?, ?)", 
-                  (hw_id, q_num, img_bytes))
+        b64_str = base64.b64encode(img_bytes).decode("utf-8")
+        q_records.append({
+            "homework_id": hw_id,
+            "q_num": q_num,
+            "image_data": b64_str
+        })
         
-    conn.commit()
-    conn.close()
+    supabase.table("questions").insert(q_records).execute()
     return hw_id, len(questions)
 
 def save_homework_from_images(title, uploaded_files):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    c.execute("INSERT INTO homeworks (title, created_at) VALUES (?, ?)", (title, now))
-    hw_id = c.lastrowid
+    hw_res = supabase.table("homeworks").insert({"title": title, "created_at": now}).execute()
+    if not hw_res.data:
+        return None
     
+    hw_id = hw_res.data[0]["id"]
     sorted_files = sorted(uploaded_files, key=natural_sort_key)
+    
+    q_records = []
     for idx, file in enumerate(sorted_files, start=1):
         image_bytes = file.read()
-        c.execute("INSERT INTO questions (homework_id, q_num, image_data) VALUES (?, ?, ?)", 
-                  (hw_id, idx, image_bytes))
+        b64_str = base64.b64encode(image_bytes).decode("utf-8")
+        q_records.append({
+            "homework_id": hw_id,
+            "q_num": idx,
+            "image_data": b64_str
+        })
         
-    conn.commit()
-    conn.close()
+    supabase.table("questions").insert(q_records).execute()
     return hw_id
 
 def get_homeworks():
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("SELECT id, title, created_at FROM homeworks ORDER BY id DESC")
-    data = c.fetchall()
-    conn.close()
-    return data
+    res = supabase.table("homeworks").select("id, title, created_at").order("id", desc=True).execute()
+    return [(d["id"], d["title"], d["created_at"]) for d in res.data] if res.data else []
 
 def delete_homework(hw_id):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("DELETE FROM homeworks WHERE id = ?", (hw_id,))
-    c.execute("DELETE FROM questions WHERE homework_id = ?", (hw_id,))
-    c.execute("DELETE FROM submissions WHERE homework_id = ?", (hw_id,))
-    conn.commit()
-    conn.close()
+    supabase.table("homeworks").delete().eq("id", hw_id).execute()
 
 def update_question_image(hw_id, q_num, image_bytes):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("UPDATE questions SET image_data = ? WHERE homework_id = ? AND q_num = ?", 
-              (image_bytes, hw_id, q_num))
-    conn.commit()
-    conn.close()
+    b64_str = base64.b64encode(image_bytes).decode("utf-8")
+    supabase.table("questions").update({"image_data": b64_str}).eq("homework_id", hw_id).eq("q_num", q_num).execute()
 
-# 개별 문항 삭제 및 번호 재정렬 함수 (신규 추가)
 def delete_question(hw_id, q_num):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    # 1. 해당 문항 삭제
-    c.execute("DELETE FROM questions WHERE homework_id = ? AND q_num = ?", (hw_id, q_num))
+    supabase.table("questions").delete().eq("homework_id", hw_id).eq("q_num", q_num).execute()
     
-    # 2. 남은 문항들 번호 1번부터 차례대로 재정렬
-    c.execute("SELECT id FROM questions WHERE homework_id = ? ORDER BY q_num", (hw_id,))
-    rows = c.fetchall()
-    for new_q_num, (q_id,) in enumerate(rows, start=1):
-        c.execute("UPDATE questions SET q_num = ? WHERE id = ?", (new_q_num, q_id))
-        
-    conn.commit()
-    conn.close()
+    res = supabase.table("questions").select("id").eq("homework_id", hw_id).order("q_num").execute()
+    if res.data:
+        for new_q_num, row in enumerate(res.data, start=1):
+            supabase.table("questions").update({"q_num": new_q_num}).eq("id", row["id"]).execute()
 
 def save_submission(student_name, hw_id, wrong_nums_list):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     wrong_str = ",".join(map(str, sorted(wrong_nums_list)))
-    c.execute("INSERT INTO submissions (student_name, homework_id, wrong_nums, submitted_at) VALUES (?, ?, ?, ?)",
-              (student_name, hw_id, wrong_str, now))
-    conn.commit()
-    conn.close()
+    supabase.table("submissions").insert({
+        "student_name": student_name,
+        "homework_id": hw_id,
+        "wrong_nums": wrong_str,
+        "submitted_at": now
+    }).execute()
 
 def get_submitted_students():
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT student_name FROM submissions")
-    data = c.fetchall()
-    conn.close()
-    return sorted([d[0] for d in data])
+    res = supabase.table("submissions").select("student_name").execute()
+    if not res.data:
+        return []
+    return sorted(list(set([d["student_name"] for d in res.data])))
 
 def get_submissions_by_student(student_name):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute('''SELECT s.id, s.student_name, h.title, s.wrong_nums, s.submitted_at, s.homework_id 
-                 FROM submissions s 
-                 JOIN homeworks h ON s.homework_id = h.id 
-                 WHERE s.student_name = ?
-                 ORDER BY s.id DESC''', (student_name,))
-    data = c.fetchall()
-    conn.close()
+    res = supabase.table("submissions").select("id, student_name, wrong_nums, submitted_at, homework_id, homeworks(title)").eq("student_name", student_name).order("id", desc=True).execute()
+    data = []
+    if res.data:
+        for row in res.data:
+            hw_title = row["homeworks"]["title"] if row.get("homeworks") and "title" in row["homeworks"] else "숙제"
+            data.append((row["id"], row["student_name"], hw_title, row["wrong_nums"], row["submitted_at"], row["homework_id"]))
     return data
 
 def delete_submission(sub_id):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("DELETE FROM submissions WHERE id = ?", (sub_id,))
-    conn.commit()
-    conn.close()
+    supabase.table("submissions").delete().eq("id", sub_id).execute()
 
 def get_question_count(hw_id):
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM questions WHERE homework_id = ?", (hw_id,))
-    count = c.fetchone()[0]
-    conn.close()
-    return count
+    res = supabase.table("questions").select("id", count="exact").eq("homework_id", hw_id).execute()
+    return res.count if res.count is not None else 0
 
 def get_wrong_questions_images(hw_id, wrong_nums_list):
     if not wrong_nums_list:
         return []
-    conn = sqlite3.connect('wrong_answer_db.db')
-    c = conn.cursor()
-    placeholders = ','.join('?' for _ in wrong_nums_list)
-    query = f"SELECT q_num, image_data FROM questions WHERE homework_id = ? AND q_num IN ({placeholders}) ORDER BY q_num"
-    c.execute(query, [hw_id] + wrong_nums_list)
-    data = c.fetchall()
-    conn.close()
+    res = supabase.table("questions").select("q_num, image_data").eq("homework_id", hw_id).in_("q_num", wrong_nums_list).order("q_num").execute()
+    data = []
+    if res.data:
+        for row in res.data:
+            img_bytes = base64.b64decode(row["image_data"])
+            data.append((row["q_num"], img_bytes))
     return data
 
 # --- 4. 인쇄 전용 CSS ---
@@ -535,7 +485,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_id = save_homework_from_images(hw_title.strip(), uploaded_files)
                         st.success(f"✅ '{hw_title}' 등록 완료! 총 {len(uploaded_files)}문제가 저장되었습니다.")
         
-        # --- [탭 2] 등록된 숙제 목록, 문제 보기 및 개별 문제 이미지 교체/삭제 ---
+        # --- [탭 2] 등록된 숙제 목록 및 개별 문제 이미지 교체/삭제 ---
         with teacher_tab2:
             st.markdown("### 📚 등록된 숙제 목록 및 개별 문제 수정")
             
