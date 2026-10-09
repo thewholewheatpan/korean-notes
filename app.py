@@ -200,7 +200,6 @@ def get_students():
     conn.close()
     return sorted([d[0] for d in data])
 
-# 학생별 총 누적 오답 개수 계산 함수
 def get_students_with_wrong_counts():
     conn = sqlite3.connect('wrong_answer_db.db')
     c = conn.cursor()
@@ -285,6 +284,22 @@ def update_question_image(hw_id, q_num, image_bytes):
     c = conn.cursor()
     c.execute("UPDATE questions SET image_data = ? WHERE homework_id = ? AND q_num = ?", 
               (image_bytes, hw_id, q_num))
+    conn.commit()
+    conn.close()
+
+# 개별 문항 삭제 및 번호 재정렬 함수 (신규 추가)
+def delete_question(hw_id, q_num):
+    conn = sqlite3.connect('wrong_answer_db.db')
+    c = conn.cursor()
+    # 1. 해당 문항 삭제
+    c.execute("DELETE FROM questions WHERE homework_id = ? AND q_num = ?", (hw_id, q_num))
+    
+    # 2. 남은 문항들 번호 1번부터 차례대로 재정렬
+    c.execute("SELECT id FROM questions WHERE homework_id = ? ORDER BY q_num", (hw_id,))
+    rows = c.fetchall()
+    for new_q_num, (q_id,) in enumerate(rows, start=1):
+        c.execute("UPDATE questions SET q_num = ? WHERE id = ?", (new_q_num, q_id))
+        
     conn.commit()
     conn.close()
 
@@ -520,7 +535,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                         hw_id = save_homework_from_images(hw_title.strip(), uploaded_files)
                         st.success(f"✅ '{hw_title}' 등록 완료! 총 {len(uploaded_files)}문제가 저장되었습니다.")
         
-        # --- [탭 2] 등록된 숙제 목록 및 개별 문제 이미지 교체 ---
+        # --- [탭 2] 등록된 숙제 목록, 문제 보기 및 개별 문제 이미지 교체/삭제 ---
         with teacher_tab2:
             st.markdown("### 📚 등록된 숙제 목록 및 개별 문제 수정")
             
@@ -545,24 +560,34 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                             st.success(f"'{title}' 숙제가 삭제되었습니다.")
                             st.rerun()
 
-                    with st.expander(f"🛠️ '{title}' 문제 보기 / 잘못 잘린 특정 문제 교체하기"):
-                        st.markdown("##### ✏️ 잘못 잘린 문제 교체하기")
-                        rep_col1, rep_col2, rep_col3 = st.columns([1, 2, 1])
+                    with st.expander(f"🛠️ '{title}' 문제 보기 / 개별 문제 교체 및 삭제하기"):
+                        st.markdown("##### ✏️ 특정 문제 이미지 교체 또는 삭제하기")
+                        rep_col1, rep_col2, rep_col3 = st.columns([1, 2, 2])
                         
                         with rep_col1:
-                            target_q_num = st.number_input("수정할 문제 번호", min_value=1, max_value=q_count, value=1, key=f"num_{hw_id}")
+                            target_q_num = st.number_input("대상 문제 번호", min_value=1, max_value=max(1, q_count), value=1, key=f"num_{hw_id}")
                         with rep_col2:
                             new_q_img = st.file_uploader("새 문제 이미지 첨부", type=['png', 'jpg', 'jpeg'], key=f"file_{hw_id}")
                         with rep_col3:
                             st.write("")
                             st.write("")
-                            if st.button("이 문제 이미지 교체", key=f"btn_rep_{hw_id}"):
-                                if new_q_img:
-                                    update_question_image(hw_id, target_q_num, new_q_img.read())
-                                    st.success(f"✅ {target_q_num}번 문제 이미지가 새로운 이미지로 교체되었습니다!")
-                                    st.rerun()
-                                else:
-                                    st.warning("교체할 이미지 파일을 등록해 주세요.")
+                            btn_c1, btn_c2 = st.columns(2)
+                            with btn_c1:
+                                if st.button("🖼️ 이미지 교체", key=f"btn_rep_{hw_id}"):
+                                    if new_q_img:
+                                        update_question_image(hw_id, target_q_num, new_q_img.read())
+                                        st.success(f"✅ {target_q_num}번 문제 이미지가 새로운 이미지로 교체되었습니다!")
+                                        st.rerun()
+                                    else:
+                                        st.warning("교체할 이미지 파일을 등록해 주세요.")
+                            with btn_c2:
+                                if st.button("🗑️ 이 문제 삭제", key=f"btn_del_q_{hw_id}"):
+                                    if q_count > 0:
+                                        delete_question(hw_id, target_q_num)
+                                        st.success(f"✅ {target_q_num}번 문제가 삭제되었습니다! (남은 문제 번호 자동 재정렬 완료)")
+                                        st.rerun()
+                                    else:
+                                        st.error("삭제할 문제가 없습니다.")
 
                         st.markdown("---")
                         
@@ -579,7 +604,7 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-        # --- [탭 3] 학생 명단 사전 등록 관리 (총 누적 오답 개수 표시 반영) ---
+        # --- [탭 3] 학생 명단 사전 등록 관리 ---
         with teacher_tab3:
             st.markdown("### 👤 학생 명단 관리")
             st.write("학생들이 오답을 제출할 때 선택할 이름 목록을 미리 등록합니다.")
