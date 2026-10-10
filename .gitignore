@@ -1,0 +1,3 @@
+# 비밀번호 등 비밀 값 (GitHub에 올라가지 않도록)
+.streamlit/secrets.toml
+__pycache__/
