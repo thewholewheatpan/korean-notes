@@ -319,9 +319,26 @@ def save_submission(student_name, hw_id, wrong_nums_list):
     return overwritten
 
 
-def delete_submission(sub_id):
-    supabase.table("submissions").delete().eq("id", sub_id).execute()
+def delete_submission(student_name, hw_id):
+    """해당 학생의 해당 숙제 제출 내역을 모두 삭제 (예전에 중복으로 쌓인 것 포함).
+    실제로 전부 지워졌으면 True, 남아 있으면 False를 반환."""
+    (
+        supabase.table("submissions")
+        .delete()
+        .eq("student_name", student_name)
+        .eq("homework_id", hw_id)
+        .execute()
+    )
     st.cache_data.clear()
+
+    left = (
+        supabase.table("submissions")
+        .select("id")
+        .eq("student_name", student_name)
+        .eq("homework_id", hw_id)
+        .execute()
+    )
+    return not left.data
 
 
 # ===== 읽기 함수 (캐싱) =====
@@ -365,8 +382,13 @@ def get_submitted_students():
 def get_submissions_by_student(student_name):
     res = supabase.table("submissions").select("id, student_name, wrong_nums, submitted_at, homework_id, homeworks(title)").eq("student_name", student_name).order("id", desc=True).execute()
     data = []
+    seen_hw = set()
     if res.data:
         for row in res.data:
+            # 같은 숙제는 가장 최근 제출 1건만 표시 (예전에 중복으로 쌓인 내역 숨김)
+            if row["homework_id"] in seen_hw:
+                continue
+            seen_hw.add(row["homework_id"])
             hw_title = row["homeworks"]["title"] if row.get("homeworks") and "title" in row["homeworks"] else "숙제"
             data.append((row["id"], row["student_name"], hw_title, row["wrong_nums"], row["submitted_at"], row["homework_id"]))
     return data
@@ -421,18 +443,20 @@ html, body { margin: 0; padding: 0; background: transparent;
   box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
 .paper { background: #fff; color: #222; border: 1px solid #ddd; border-radius: 8px;
   padding: 20px 22px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-.note-header { text-align: center; padding-bottom: 12px; border-bottom: 2px solid #222; margin-bottom: 18px; }
-.note-header h2 { margin: 0; font-size: 24px; }
+.note-header { text-align: center; padding-bottom: 8px; border-bottom: 2px solid #222; margin-bottom: 12px; }
+.note-header h2 { margin: 0; font-size: 22px; }
 .note-meta { margin-top: 8px; font-size: 15px; color: #333; line-height: 1.6; }
 .note-meta .name { color: #1e88e5; }
 .note-meta .cnt { color: #e53935; }
 .note-meta .date { color: #777; font-size: 13px; }
 .cols { column-count: 2; column-gap: 18px; }
-.item { display: inline-block; width: 100%; break-inside: avoid; page-break-inside: avoid;
-  margin: 0 0 18px 0; }
-.qnum { font-size: 12px; color: #777; margin-bottom: 4px; }
+/* 문제 하나가 너무 길면 통째로 다음 쪽으로 밀리는 문제가 있어서,
+   '문제 이미지'와 '풀이 칸'은 각각 안 쪼개되, 둘 사이에서는 쪽/단이 나뉠 수 있게 함 */
+.item { margin: 0 0 16px 0; }
+.qimg { break-inside: avoid; page-break-inside: avoid; }
+.qnum { font-size: 12px; color: #777; margin-bottom: 4px; break-after: avoid; page-break-after: avoid; }
 .item img { width: 100%; height: auto; display: block; }
-.answer { border: 1px solid #888; border-radius: 4px; margin-top: 6px; }
+.answer { border: 1px solid #888; border-radius: 4px; margin-top: 6px; break-inside: avoid; page-break-inside: avoid; }
 .answer .sec { padding: 4px 8px 6px 8px; }
 .answer .sec + .sec { border-top: 1px dashed #888; }
 .answer .label { font-size: 12px; font-weight: bold; color: #444; margin-bottom: 2px; }
@@ -446,6 +470,8 @@ html, body { margin: 0; padding: 0; background: transparent;
   .toolbar { display: none !important; }
   .paper { border: none; box-shadow: none; border-radius: 0; padding: 0; }
   #root { padding: 0; }
+  /* 아주 긴 문제 이미지도 한 쪽 안에 들어오도록 높이 제한 */
+  .item img { width: auto; max-width: 100%; max-height: 220mm; }
 }
 </style>
 """
@@ -476,11 +502,13 @@ def build_notebook_html(student_name, hw_title, submitted_at, images):
     for q_num, img_bytes in images:
         items.append(
             '<div class="item">'
+            '<div class="qimg">'
             f'<div class="qnum">문제 {q_num}번</div>'
             f'<img src="{_img_data_uri(img_bytes)}">'
+            '</div>'
             '<div class="answer">'
-            '<div class="sec"><div class="label">풀이</div><div class="lines"></div></div>'
-            '<div class="sec"><div class="label">틀린 이유</div><div class="lines short"></div></div>'
+            f'<div class="sec"><div class="label">{q_num}번 풀이</div><div class="lines"></div></div>'
+            f'<div class="sec"><div class="label">{q_num}번 틀린 이유</div><div class="lines short"></div></div>'
             '</div></div>'
         )
     items_html = "".join(items)
@@ -846,9 +874,11 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
                     col1, col2 = st.columns([3, 1])
                     with col2:
                         if st.button("🗑️ 이 숙제 제출 내역 삭제"):
-                            delete_submission(sub_id)
-                            st.success(f"'{student_name}' 학생의 '{hw_title}' 제출 내역이 삭제되었습니다.")
-                            st.rerun()
+                            if delete_submission(student_name, hw_id):
+                                st.toast(f"'{student_name}' 학생의 '{hw_title}' 제출 내역이 삭제되었습니다.", icon="✅")
+                                st.rerun()
+                            else:
+                                st.error("삭제되지 않았습니다. Supabase의 삭제 권한(RLS 정책)을 확인해 주세요.")
 
                     st.markdown("---")
 
