@@ -5,6 +5,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 import io
 import base64
+import html as html_lib
 from supabase import create_client, Client
 
 st.set_page_config(page_title="국어 오답노트 생성 시스템", page_icon="📚")
@@ -279,15 +280,43 @@ def delete_question(hw_id, q_num):
 
 
 def save_submission(student_name, hw_id, wrong_nums_list):
+    """같은 학생+같은 숙제의 기존 제출이 있으면 덮어쓰고, 없으면 새로 저장.
+    덮어썼으면 True, 새로 저장했으면 False를 반환."""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     wrong_str = ",".join(map(str, sorted(wrong_nums_list)))
-    supabase.table("submissions").insert({
-        "student_name": student_name,
-        "homework_id": hw_id,
-        "wrong_nums": wrong_str,
-        "submitted_at": now
-    }).execute()
+
+    existing = (
+        supabase.table("submissions")
+        .select("id")
+        .eq("student_name", student_name)
+        .eq("homework_id", hw_id)
+        .order("id", desc=True)
+        .execute()
+    )
+    rows = existing.data or []
+
+    if rows:
+        keep_id = rows[0]["id"]
+        supabase.table("submissions").update({
+            "wrong_nums": wrong_str,
+            "submitted_at": now
+        }).eq("id", keep_id).execute()
+        # 예전에 중복으로 쌓인 내역이 있으면 함께 정리
+        extra_ids = [r["id"] for r in rows[1:]]
+        if extra_ids:
+            supabase.table("submissions").delete().in_("id", extra_ids).execute()
+        overwritten = True
+    else:
+        supabase.table("submissions").insert({
+            "student_name": student_name,
+            "homework_id": hw_id,
+            "wrong_nums": wrong_str,
+            "submitted_at": now
+        }).execute()
+        overwritten = False
+
     st.cache_data.clear()
+    return overwritten
 
 
 def delete_submission(sub_id):
@@ -343,6 +372,22 @@ def get_submissions_by_student(student_name):
     return data
 
 
+@st.cache_data(ttl=60)
+def get_existing_submission(student_name, hw_id):
+    res = (
+        supabase.table("submissions")
+        .select("wrong_nums, submitted_at")
+        .eq("student_name", student_name)
+        .eq("homework_id", hw_id)
+        .order("id", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]["wrong_nums"], res.data[0]["submitted_at"]
+    return None
+
+
 @st.cache_data(ttl=300)
 def get_question_count(hw_id):
     res = supabase.table("questions").select("id", count="exact").eq("homework_id", hw_id).execute()
@@ -363,6 +408,108 @@ def get_wrong_questions_images(hw_id, wrong_nums):
     return data
 
 
+# --- 3-1. 오답노트 HTML 생성 (이 HTML만 따로 인쇄됨) ---
+NOTE_CSS = """
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: transparent;
+  font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; }
+#root { padding: 4px; }
+.toolbar { text-align: center; margin-bottom: 12px; }
+.print-btn { background-color: #1e88e5; color: white; padding: 12px 28px; font-size: 16px;
+  font-weight: bold; border: none; border-radius: 8px; cursor: pointer;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+.paper { background: #fff; color: #222; border: 1px solid #ddd; border-radius: 8px;
+  padding: 20px 22px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.note-header { text-align: center; padding-bottom: 12px; border-bottom: 2px solid #222; margin-bottom: 18px; }
+.note-header h2 { margin: 0; font-size: 24px; }
+.note-meta { margin-top: 8px; font-size: 15px; color: #333; line-height: 1.6; }
+.note-meta .name { color: #1e88e5; }
+.note-meta .cnt { color: #e53935; }
+.note-meta .date { color: #777; font-size: 13px; }
+.cols { column-count: 2; column-gap: 18px; }
+.item { display: inline-block; width: 100%; break-inside: avoid; page-break-inside: avoid;
+  margin: 0 0 18px 0; }
+.qnum { font-size: 12px; color: #777; margin-bottom: 4px; }
+.item img { width: 100%; height: auto; display: block; }
+.answer { border: 1px solid #888; border-radius: 4px; margin-top: 6px; }
+.answer .sec { padding: 4px 8px 6px 8px; }
+.answer .sec + .sec { border-top: 1px dashed #888; }
+.answer .label { font-size: 12px; font-weight: bold; color: #444; margin-bottom: 2px; }
+.answer .lines { height: 110px;
+  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent 21px, #c8c8c8 21px, #c8c8c8 22px); }
+.answer .lines.short { height: 66px; }
+@media screen and (max-width: 600px) { .cols { column-count: 1; } }
+@media print {
+  @page { size: A4; margin: 12mm; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .toolbar { display: none !important; }
+  .paper { border: none; box-shadow: none; border-radius: 0; padding: 0; }
+  #root { padding: 0; }
+}
+</style>
+"""
+
+NOTE_JS = """
+<script>
+function fit() {
+  try {
+    var h = document.getElementById('root').offsetHeight + 16;
+    if (window.frameElement) { window.frameElement.style.height = h + 'px'; }
+  } catch (e) {}
+}
+window.addEventListener('load', fit);
+window.addEventListener('resize', fit);
+document.querySelectorAll('img').forEach(function (i) { i.addEventListener('load', fit); });
+setTimeout(fit, 300);
+</script>
+"""
+
+
+def _img_data_uri(img_bytes):
+    mime = "image/jpeg" if img_bytes[:3] == b"\xff\xd8\xff" else "image/png"
+    return f"data:{mime};base64,{base64.b64encode(img_bytes).decode('utf-8')}"
+
+
+def build_notebook_html(student_name, hw_title, submitted_at, images):
+    items = []
+    for q_num, img_bytes in images:
+        items.append(
+            '<div class="item">'
+            f'<div class="qnum">문제 {q_num}번</div>'
+            f'<img src="{_img_data_uri(img_bytes)}">'
+            '<div class="answer">'
+            '<div class="sec"><div class="label">풀이</div><div class="lines"></div></div>'
+            '<div class="sec"><div class="label">틀린 이유</div><div class="lines short"></div></div>'
+            '</div></div>'
+        )
+    items_html = "".join(items)
+    name = html_lib.escape(str(student_name))
+    title = html_lib.escape(str(hw_title))
+    when = html_lib.escape(str(submitted_at))
+
+    body = f"""
+    <div id="root">
+      <div class="toolbar">
+        <button class="print-btn" onclick="window.print()">🖨️ 이 오답노트만 인쇄하기 (또는 PDF 저장)</button>
+      </div>
+      <div class="paper">
+        <div class="note-header">
+          <h2>맞춤 오답노트</h2>
+          <div class="note-meta">
+            학생 이름: <b class="name">{name}</b> &nbsp;|&nbsp;
+            숙제명: <b>{title}</b> &nbsp;|&nbsp;
+            오답 개수: <b class="cnt">총 {len(images)}문제</b>
+            <div class="date">제출일시: {when}</div>
+          </div>
+        </div>
+        <div class="cols">{items_html}</div>
+      </div>
+    </div>
+    """
+    return NOTE_CSS + body + NOTE_JS
+
+
 # --- 4. 인쇄 전용 CSS ---
 st.markdown("""
     <style>
@@ -381,8 +528,7 @@ st.markdown("""
         .stAppToolbar,
         .stTabs [role="tablist"],
         .no-print,
-        button,
-        iframe {
+        button {
             display: none !important;
             visibility: hidden !important;
             height: 0 !important;
@@ -441,7 +587,9 @@ if selected_menu == "📝 [학생] 오답 체크하기":
 
         # form으로 감싸서 체크박스를 누를 때마다 재실행되지 않게 함
         # (제출 버튼을 눌렀을 때만 한 번 실행됨)
-        with st.form("submit_form"):
+        notice_box = st.empty()  # 기존 제출 안내가 들어갈 자리
+
+        with st.form("submit_form", clear_on_submit=True):
             wrong_answers = []
             for row_start in range(1, total_q + 1, 5):
                 cols = st.columns(5)
@@ -459,8 +607,17 @@ if selected_menu == "📝 [학생] 오답 체크하기":
             if not wrong_answers:
                 st.warning("틀린 문제 번호를 하나 이상 선택해 주세요.")
             else:
-                save_submission(student_name, selected_hw_id, wrong_answers)
-                st.success(f"🎉 {student_name} 학생, 제출이 완료되었습니다! 오답 문제 (총 {len(wrong_answers)}개): {wrong_answers}")
+                overwritten = save_submission(student_name, selected_hw_id, wrong_answers)
+                if overwritten:
+                    st.success(f"🔄 {student_name} 학생, 기존 제출 내역을 새 내용으로 덮어썼습니다! 오답 문제 (총 {len(wrong_answers)}개): {wrong_answers}")
+                else:
+                    st.success(f"🎉 {student_name} 학생, 제출이 완료되었습니다! 오답 문제 (총 {len(wrong_answers)}개): {wrong_answers}")
+
+        # 이미 제출한 내역이 있으면 안내 (제출 처리 후의 최신 상태 기준으로 표시)
+        existing = get_existing_submission(student_name, selected_hw_id)
+        if existing:
+            prev_nums, prev_time = existing
+            notice_box.info(f"ℹ️ 이 숙제는 이미 제출한 내역이 있어요 (제출: {prev_time}, 오답: {prev_nums}). 다시 제출하면 기존 내용이 **새 내용으로 덮어쓰기**됩니다.")
 
 # -------------------------------------------------------------
 # 메뉴 2: [선생님] 관리자 모드
@@ -695,37 +852,11 @@ elif selected_menu == "🔒 [선생님] 관리자 모드":
 
                     st.markdown("---")
 
-                    st.components.v1.html("""
-                        <div style="text-align: center;">
-                            <button onclick="window.parent.print()" style="
-                                background-color: #1e88e5;
-                                color: white;
-                                padding: 12px 28px;
-                                font-size: 16px;
-                                font-weight: bold;
-                                border: none;
-                                border-radius: 8px;
-                                cursor: pointer;
-                                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                            ">🖨️ 이 오답노트 바로 인쇄하기 (또는 PDF 저장)</button>
-                        </div>
-                    """, height=55)
-
-                    st.markdown(f"""
-                    <div style="text-align: center; padding: 12px 0; border-bottom: 2px solid #222; margin-bottom: 20px;">
-                        <h2 style="margin: 0; font-size: 26px;">📄 맞춤 오답노트</h2>
-                        <h3 style="margin: 8px 0 0 0; color: #333; font-size: 18px;">
-                            학생 이름: <span style="color: #1e88e5;"><b>{student_name}</b></span> &nbsp;|&nbsp;
-                            숙제명: <b>{hw_title}</b> &nbsp;|&nbsp;
-                            오답 개수: <span style="color: #e53935;"><b>총 {len(wrong_list)}문제</b></span>
-                        </h3>
-                    </div>
-                    """, unsafe_allow_html=True)
-
                     images = get_wrong_questions_images(hw_id, tuple(wrong_list))
 
                     if images:
-                        cols_print = st.columns(2)
-                        for idx, (q_num, img_bytes) in enumerate(images):
-                            with cols_print[idx % 2]:
-                                st.image(img_bytes, use_container_width=True)
+                        note_html = build_notebook_html(student_name, hw_title, submitted_at, images)
+                        # 인쇄 버튼이 이 iframe 안에 있어서, 인쇄하면 오답노트 부분만 출력됨
+                        st.components.v1.html(note_html, height=900, scrolling=True)
+                    else:
+                        st.info("표시할 오답 문제 이미지가 없습니다.")
