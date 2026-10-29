@@ -522,6 +522,24 @@ window.addEventListener('load', fit);
 window.addEventListener('resize', fit);
 document.querySelectorAll('img').forEach(function (i) { i.addEventListener('load', fit); });
 setTimeout(fit, 300);
+
+// 맥 Safari는 iframe 안에서 window.print()를 부르면 무시하거나 바깥 페이지 전체를 인쇄함.
+// 그래서 iframe 안이면 오답노트를 새 창에 그대로 옮겨 그 창에서 인쇄하고,
+// 새 창(맨 바깥 페이지)에서는 바로 인쇄함. 새 창이 막히면 원래 방식으로 인쇄.
+function printNote() {
+  if (window.self === window.top) { window.print(); return; }
+  var w = window.open('', '_blank');
+  if (!w) { window.print(); return; }
+  w.document.open();
+  // <style>은 head에 들어가 있으므로 head·body를 통째로 옮김
+  w.document.write('<!doctype html><html>' + document.documentElement.innerHTML + '</html>');
+  w.document.close();
+  w.document.title = '오답노트';
+}
+// 새 창에서 열렸으면 이미지를 다 불러온 뒤 인쇄 창을 띄움 (안 뜨면 화면의 인쇄 버튼을 누르면 됨)
+if (window.self === window.top && window.opener) {
+  window.addEventListener('load', function () { setTimeout(function () { window.print(); }, 300); });
+}
 </script>
 """
 
@@ -551,7 +569,7 @@ def build_notebook_html(student_name, hw_title, submitted_at, images):
     body = f"""
     <div id="root">
       <div class="toolbar">
-        <button class="print-btn" onclick="window.print()">🖨️ 이 오답노트만 인쇄하기 (또는 PDF 저장)</button>
+        <button class="print-btn" onclick="printNote()">🖨️ 이 오답노트만 인쇄하기 (또는 PDF 저장)</button>
       </div>
       <div class="paper">
         <div class="note-header">
