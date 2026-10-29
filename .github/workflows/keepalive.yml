@@ -1,0 +1,49 @@
+# 앱이 잠들지 않도록 6시간마다 실제 브라우저로 접속함
+# (Streamlit Cloud는 12시간 동안 접속이 없으면 잠듦)
+# 앱 주소는 저장소 Settings > Secrets and variables > Actions > Variables 의 APP_URL 에 넣음
+name: keepalive
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"  # 정각은 GitHub 쪽이 붐벼서 지연되므로 17분에 실행
+  workflow_dispatch:
+
+permissions:
+  actions: write  # 아래 '예약 실행 유지' 단계에서 사용
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright==1.55.0
+          python -m playwright install --with-deps chromium
+
+      - name: Wake app
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: python scripts/keepalive.py
+
+      - name: Upload screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepalive-failed
+          path: keepalive-failed.png
+          if-no-files-found: ignore
+
+      # 공개 저장소는 60일 동안 커밋이 없으면 예약 실행이 자동으로 꺼짐.
+      # 매번 다시 켜 두어서 꺼지지 않게 함
+      - name: Keep schedule enabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/keepalive.yml/enable"
