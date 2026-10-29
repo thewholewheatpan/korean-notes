@@ -479,33 +479,41 @@ html, body { margin: 0; padding: 0; background: transparent;
 .note-meta .name { color: #1e88e5; }
 .note-meta .cnt { color: #e53935; }
 .note-meta .date { color: #777; font-size: 13px; }
-.cols { column-count: 2; column-gap: 18px; }
-/* 문제 하나가 너무 길면 통째로 다음 쪽으로 밀리는 문제가 있어서,
-   '문제 이미지'와 '풀이 칸'은 각각 안 쪼개되, 둘 사이에서는 쪽/단이 나뉠 수 있게 함 */
-.item { margin: 0 0 16px 0; }
-.qimg { break-inside: avoid; page-break-inside: avoid; }
-.qnum { font-size: 12px; color: #777; margin-bottom: 4px; break-after: avoid; page-break-after: avoid; }
+/* 2단 배치: Safari는 인쇄할 때 column-count(다단)를 무시해서 한 단으로 나오므로,
+   문제 하나(이미지+풀이 칸)를 inline-block 칸으로 만들어 두 개씩 나란히 놓음.
+   inline-block은 쪽 사이에서 쪼개지지 않아 문제가 통째로 다음 쪽으로 넘어감 */
+.cols { font-size: 0; }
+.item { display: inline-block; vertical-align: top; width: calc(50% - 9px);
+  margin: 0 0 16px 0; font-size: 14px; break-inside: avoid; page-break-inside: avoid; }
+.item:nth-child(odd) { margin-right: 18px; }
+.qnum { font-size: 12px; color: #777; margin-bottom: 4px; }
 .item img { width: 100%; height: auto; display: block; }
-.answer { border: 1px solid #888; border-radius: 4px; margin-top: 6px; break-inside: avoid; page-break-inside: avoid; }
+.answer { border: 1px solid #888; border-radius: 4px; margin-top: 6px; }
 .answer .sec { padding: 4px 8px 6px 8px; }
 .answer .sec + .sec { border-top: 1px dashed #888; }
 .answer .label { font-size: 12px; font-weight: bold; color: #444; margin-bottom: 2px; }
+/* 줄 칸: Safari는 인쇄할 때 그라디언트의 transparent를 검은색으로 칠하므로 흰색을 씀 */
 .answer .lines { height: 110px;
-  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent 21px, #c8c8c8 21px, #c8c8c8 22px); }
+  background-image: repeating-linear-gradient(to bottom, #fff 0, #fff 21px, #c8c8c8 21px, #c8c8c8 22px); }
 .answer .lines.short { height: 66px; }
-@media screen and (max-width: 600px) { .cols { column-count: 1; } }
+@media screen and (max-width: 600px) {
+  .item { width: 100%; }
+  .item:nth-child(odd) { margin-right: 0; }
+}
 @media print {
-  /* 브라우저가 찍는 머리글·바닥글(날짜, 제목, 주소, 쪽 번호)은 @page 여백 안에 그려짐.
-     여백을 0으로 해서 머리글·바닥글이 들어갈 자리를 없애고,
-     종이 가장자리 여백은 .paper 안쪽 여백으로 대신함 (clone: 쪽마다 위아래 여백 반복) */
-  @page { size: A4; margin: 0; }
+  /* 쪽 여백은 @page로 주고(쪽마다 반복됨), 비어 있는 margin box를 선언해서
+     Chrome·Edge가 여백에 찍는 머리글·바닥글(날짜, 제목, 주소, 쪽 번호)을 끔 */
+  @page {
+    size: A4; margin: 12mm;
+    @top-left { content: ""; } @top-center { content: ""; } @top-right { content: ""; }
+    @bottom-left { content: ""; } @bottom-center { content: ""; } @bottom-right { content: ""; }
+  }
   * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .toolbar { display: none !important; }
-  .paper { border: none; box-shadow: none; border-radius: 0; padding: 12mm;
-    -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+  .paper { border: none; box-shadow: none; border-radius: 0; padding: 0; }
   #root { padding: 0; }
-  /* 아주 긴 문제 이미지도 한 쪽 안에 들어오도록 높이 제한 */
-  .item img { width: auto; max-width: 100%; max-height: 220mm; }
+  /* 문제 하나(이미지+풀이 칸)가 한 쪽 안에 들어오도록 이미지 높이 제한 */
+  .item img { width: auto; max-width: 100%; max-height: 190mm; }
 }
 </style>
 """
