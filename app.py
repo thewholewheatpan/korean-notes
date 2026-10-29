@@ -482,7 +482,9 @@ html, body { margin: 0; padding: 0; background: transparent;
 /* 2단 배치: Safari는 인쇄할 때 column-count(다단)를 무시해서 한 단으로 나오므로,
    문제 하나(이미지+풀이 칸)를 inline-block 칸으로 만들어 두 개씩 나란히 놓음.
    inline-block은 쪽 사이에서 쪼개지지 않아 문제가 통째로 다음 쪽으로 넘어감 */
-.cols { font-size: 0; }
+/* 문제 줄(row)이 글자 줄처럼 취급돼서, 기본값(쪽 끝·시작에 최소 2줄)이면
+   Chrome이 1쪽에 자리가 있어도 첫 줄을 다음 쪽으로 밀어냄 */
+.cols { font-size: 0; orphans: 1; widows: 1; }
 .item { display: inline-block; vertical-align: top; width: calc(50% - 9px);
   margin: 0 0 16px 0; font-size: 14px; break-inside: avoid; page-break-inside: avoid; }
 .item:nth-child(odd) { margin-right: 18px; }
@@ -492,19 +494,20 @@ html, body { margin: 0; padding: 0; background: transparent;
 .answer .sec { padding: 4px 8px 6px 8px; }
 .answer .sec + .sec { border-top: 1px dashed #888; }
 .answer .label { font-size: 12px; font-weight: bold; color: #444; margin-bottom: 2px; }
-/* 줄 칸: Safari는 인쇄할 때 그라디언트의 transparent를 검은색으로 칠하므로 흰색을 씀 */
-.answer .lines { height: 110px;
-  background-image: repeating-linear-gradient(to bottom, #fff 0, #fff 21px, #c8c8c8 21px, #c8c8c8 22px); }
-.answer .lines.short { height: 66px; }
+/* 줄 칸: 그라디언트 배경으로 줄을 그리면 프린터로 보낼 때 줄이 사라지거나 회색 띠로 찍혀서
+   (맥 Safari), 줄마다 아래 테두리가 있는 칸을 쌓아 실제 선으로 그림 */
+.answer .ln { height: 22px; border-bottom: 1px solid #c8c8c8; }
 @media screen and (max-width: 600px) {
   .item { width: 100%; }
   .item:nth-child(odd) { margin-right: 0; }
 }
 @media print {
   /* 쪽 여백은 @page로 주고(쪽마다 반복됨), 비어 있는 margin box를 선언해서
-     Chrome·Edge가 여백에 찍는 머리글·바닥글(날짜, 제목, 주소, 쪽 번호)을 끔 */
+     Chrome·Edge가 여백에 찍는 머리글·바닥글(날짜, 제목, 주소, 쪽 번호)을 끔.
+     용지 크기(size)는 지정하지 않음: 지정하면 프린터가 모르는 '사용자 지정 크기'로
+     보내져서 '맞는 용지가 없다'는 오류가 남. 인쇄 창·프린터 기본 용지를 따름 */
   @page {
-    size: A4; margin: 12mm;
+    margin: 12mm;
     @top-left { content: ""; } @top-center { content: ""; } @top-right { content: ""; }
     @bottom-left { content: ""; } @bottom-center { content: ""; } @bottom-right { content: ""; }
   }
@@ -512,8 +515,8 @@ html, body { margin: 0; padding: 0; background: transparent;
   .toolbar { display: none !important; }
   .paper { border: none; box-shadow: none; border-radius: 0; padding: 0; }
   #root { padding: 0; }
-  /* 문제 하나(이미지+풀이 칸)가 한 쪽 안에 들어오도록 이미지 높이 제한 */
-  .item img { width: auto; max-width: 100%; max-height: 190mm; }
+  /* 문제 하나(이미지+풀이 칸)가 한 쪽 안에 들어오도록 이미지 높이 제한 (A4보다 짧은 레터 용지 기준) */
+  .item img { width: auto; max-width: 100%; max-height: 175mm; }
 }
 </style>
 """
@@ -555,6 +558,9 @@ def _img_data_uri(img_bytes):
     mime = "image/jpeg" if img_bytes[:3] == b"\xff\xd8\xff" else "image/png"
     return f"data:{mime};base64,{base64.b64encode(img_bytes).decode('utf-8')}"
 
+def _ruled_lines(count):
+    return '<div class="ln"></div>' * count
+
 def build_notebook_html(student_name, hw_title, submitted_at, images):
     items = []
     for q_num, img_bytes in images:
@@ -565,8 +571,8 @@ def build_notebook_html(student_name, hw_title, submitted_at, images):
             f'<img src="{_img_data_uri(img_bytes)}">'
             '</div>'
             '<div class="answer">'
-            f'<div class="sec"><div class="label">{q_num}번 풀이</div><div class="lines"></div></div>'
-            f'<div class="sec"><div class="label">{q_num}번 틀린 이유</div><div class="lines short"></div></div>'
+            f'<div class="sec"><div class="label">{q_num}번 풀이</div>{_ruled_lines(5)}</div>'
+            f'<div class="sec"><div class="label">{q_num}번 틀린 이유</div>{_ruled_lines(3)}</div>'
             '</div></div>'
         )
     items_html = "".join(items)
